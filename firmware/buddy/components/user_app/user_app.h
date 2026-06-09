@@ -11,6 +11,7 @@ extern "C" {
 
 void user_app_init(void);
 void user_ui_init(void);
+void user_power_off(void);   // cut the battery rail (clean shutdown when on battery)
 
 #ifdef __cplusplus
 }

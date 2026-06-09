@@ -31,6 +31,9 @@
 #include "sdmmc_cmd.h"
 #include "driver/sdmmc_host.h"
 #include "esp_netif_sntp.h"
+#include "esp_adc/adc_oneshot.h"
+#include "esp_adc/adc_cali.h"
+#include "esp_adc/adc_cali_scheme.h"
 #include "cJSON.h"
 #include "lvgl.h"
 
@@ -73,6 +76,7 @@ static SemaphoreHandle_t s_display_poke = NULL;  // give -> poll task does an im
 
 // UI widgets we update at runtime.
 static lv_obj_t *s_lbl_tokens = NULL;
+static lv_obj_t *s_lbl_batt = NULL;   // battery % (top-right)
 static lv_obj_t *s_lbl_ctx = NULL;
 static lv_obj_t *s_bar_ctx = NULL;
 static lv_obj_t *s_lbl_you = NULL;   // your last transcript (1 line, truncated)
@@ -80,6 +84,7 @@ static lv_obj_t *s_lbl_max = NULL;   // Max's reply (wrapped, main content)
 
 // Last-rendered text per zone, so we only repaint (slow e-paper refresh) on change.
 static char s_last_tokens[64] = "";
+static char s_last_batt[16] = "";
 static char s_last_ctx[48] = "";
 static char s_last_you[288] = "";
 static char s_last_max[320] = "";        // text currently shown on the "Max:" line
@@ -154,6 +159,15 @@ static void build_ui(void)
     lv_obj_set_style_text_color(s_lbl_tokens, lv_color_black(), 0);
     lv_obj_set_pos(s_lbl_tokens, 4, 2);
     lv_label_set_text(s_lbl_tokens, "Tokens: --");
+
+    // Battery % (top-right, right-aligned).
+    s_lbl_batt = lv_label_create(scr);
+    lv_obj_set_style_text_font(s_lbl_batt, &lv_font_montserratMedium_16, 0);
+    lv_obj_set_style_text_color(s_lbl_batt, lv_color_black(), 0);
+    lv_obj_set_pos(s_lbl_batt, 150, 4);
+    lv_obj_set_size(s_lbl_batt, 46, 18);
+    lv_obj_set_style_text_align(s_lbl_batt, LV_TEXT_ALIGN_RIGHT, 0);
+    lv_label_set_text(s_lbl_batt, "");
 
     // Zone 2: context-window % label + bar.
     s_lbl_ctx = lv_label_create(scr);
@@ -353,6 +367,54 @@ static long long now_epoch(void)
     return (t > 1000000000) ? (long long)t : 0;
 }
 
+// --- Battery: ADC1 ch3 (GPIO4), 12-bit, 12dB; actual volts = measured x2 (divider). ---
+static adc_oneshot_unit_handle_t s_adc = NULL;
+static adc_cali_handle_t s_adc_cali = NULL;
+
+static void battery_adc_init(void)
+{
+    adc_oneshot_unit_init_cfg_t ucfg = {};
+    ucfg.unit_id = ADC_UNIT_1;
+    if (adc_oneshot_new_unit(&ucfg, &s_adc) != ESP_OK) { s_adc = NULL; return; }
+    adc_oneshot_chan_cfg_t ccfg = {};
+    ccfg.atten = ADC_ATTEN_DB_12;
+    ccfg.bitwidth = ADC_BITWIDTH_12;
+    adc_oneshot_config_channel(s_adc, ADC_CHANNEL_3, &ccfg);
+    adc_cali_curve_fitting_config_t cal = {};
+    cal.unit_id = ADC_UNIT_1;
+    cal.chan = ADC_CHANNEL_3;
+    cal.atten = ADC_ATTEN_DB_12;
+    cal.bitwidth = ADC_BITWIDTH_12;
+    if (adc_cali_create_scheme_curve_fitting(&cal, &s_adc_cali) != ESP_OK) s_adc_cali = NULL;
+}
+
+// Battery millivolts (averaged), or -1 on error. Doubles to undo the divider.
+static int battery_mv(void)
+{
+    if (!s_adc) return -1;
+    int acc = 0, n = 0;
+    for (int i = 0; i < 8; i++) {
+        int raw = 0;
+        if (adc_oneshot_read(s_adc, ADC_CHANNEL_3, &raw) != ESP_OK) continue;
+        int mv = 0;
+        if (!(s_adc_cali && adc_cali_raw_to_voltage(s_adc_cali, raw, &mv) == ESP_OK))
+            mv = raw * 3300 / 4095;
+        acc += mv;
+        n++;
+    }
+    return n ? (acc / n) * 2 : -1;
+}
+
+// Rough 1S LiPo percentage (3.30V empty .. 4.20V full).
+static int battery_pct(int mv)
+{
+    if (mv < 2500) return -1;  // implausibly low -> treat as "no reading" (blank)
+    int pct = (mv - 3300) * 100 / (4200 - 3300);
+    if (pct < 0) pct = 0;
+    if (pct > 100) pct = 100;
+    return pct;
+}
+
 // --- Audible feedback (ES8311 speaker; codec already open for playback). ---
 #define BEEP_MAX_MS    200
 #define BEEP_BUF_BYTES ((SAMPLE_RATE_HZ / 1000) * BEEP_MAX_MS * BYTES_PER_FRAME)
@@ -542,11 +604,20 @@ static void http_get_display(void)
     char you_buf[288];
     snprintf(you_buf, sizeof(you_buf), "You: %s", txt[0] ? txt : "(say something)");
 
+    int bpct = battery_pct(battery_mv());
+    char batt_str[12];
+    if (bpct >= 0) snprintf(batt_str, sizeof(batt_str), "%d%%", bpct);
+    else batt_str[0] = '\0';
+
     // Only repaint changed zones — each change is a (slow) e-paper refresh.
     if (lvgl_lock(1000)) {
         if (strcmp(s_last_tokens, tokens_str) != 0) {
             lv_label_set_text(s_lbl_tokens, tokens_str);
             strncpy(s_last_tokens, tokens_str, sizeof(s_last_tokens) - 1);
+        }
+        if (strcmp(s_last_batt, batt_str) != 0) {
+            lv_label_set_text(s_lbl_batt, batt_str);
+            strncpy(s_last_batt, batt_str, sizeof(s_last_batt) - 1);
         }
         refresh_ctx_line_locked();  // composes base % + mode/queue status, updates bar
         if (strcmp(s_last_you, you_buf) != 0) {
@@ -1019,6 +1090,15 @@ static void pwr_button_task(void *arg)
             refresh_ctx_line();
             render_reply();   // clear the reply line in Notes mode; restore otherwise
         }
+        if (get_bit_button(e, 2)) {  // PWR long-press -> power off (cuts battery rail)
+            ESP_LOGW(TAG, "PWR long-press: powering off");
+            xSemaphoreTake(s_audio_mux, portMAX_DELAY);
+            play_tone(784, 90, 11000); play_tone(523, 130, 11000); play_tone(330, 220, 11000);
+            xSemaphoreGive(s_audio_mux);
+            vTaskDelay(pdMS_TO_TICKS(250));
+            user_power_off();
+            vTaskDelay(pdMS_TO_TICKS(3000));  // if still on USB power, don't spin
+        }
     }
 }
 
@@ -1033,6 +1113,15 @@ extern "C" void app_main(void)
 
     // LVGL display on top of the (already-initialized) e-paper driver.
     display_init();
+
+    // Battery voltage sense (ADC). Log it so we can confirm the pack is connected.
+    battery_adc_init();
+    {
+        int raw = -1;
+        if (s_adc) adc_oneshot_read(s_adc, ADC_CHANNEL_3, &raw);
+        int mv = battery_mv();
+        ESP_LOGI(TAG, "battery: raw=%d, %d mV (~%d%%)", raw, mv, battery_pct(mv));
+    }
 
     // Mount the TF/SD card (for offline capture queue) and self-test it.
     s_sd_ok = sdcard_mount();

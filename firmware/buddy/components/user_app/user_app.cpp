@@ -28,7 +28,7 @@ void user_app_init(void)
     lvgl_button_groups = xEventGroupCreate();
 	audio_ptr = (uint8_t *)heap_caps_malloc(288 * 1000 * sizeof(uint8_t), MALLOC_CAP_SPIRAM);
 
-    //board_div.VBAT_POWER_ON();
+    board_div.VBAT_POWER_ON();   // latch the battery rail so we keep running off USB
     board_div.POWEER_EPD_ON();
     board_div.POWEER_Audio_ON();
     i2c_master_Init();
@@ -51,6 +51,11 @@ void user_app_init(void)
     user_button_init();
     audio_bsp_init();
     audio_play_init();
+}
+
+void user_power_off(void)
+{
+    board_div.VBAT_POWER_OFF();   // drops GPIO17 — on battery this powers the board off
 }
 
 void led_test_task(void *arg)
