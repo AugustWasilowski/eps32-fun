@@ -738,9 +738,12 @@ static void start_play_server(void)
 #define SD_D0_PIN   GPIO_NUM_40
 #define SD_MOUNT    "/sdcard"
 #define QUEUE_DIR   SD_MOUNT "/queue"
+#define MODES_DIR   SD_MOUNT "/modes"        // spoken mode-name clips (max/leo/notes .pcm)
+#define MODECLIP_BUF_BYTES (64 * 1024)
 static bool s_sd_ok = false;
 static SemaphoreHandle_t s_sd_mux = NULL;   // serialize SD file ops
 static uint32_t s_next_seq = 0;             // next queue filename number
+static uint8_t *s_modeclip_buf = NULL;      // scratch for mode-name clip load/play
 
 static bool sdcard_mount(void)
 {
@@ -777,6 +780,75 @@ static void sdcard_selftest(void)
     f = fopen(SD_MOUNT "/buddy_test.txt", "r");
     if (f) { if (!fgets(line, sizeof(line), f)) line[0] = '\0'; fclose(f); }
     ESP_LOGI(TAG, "SD test: wrote+read back \"%s\"", line);
+}
+
+// --- Spoken mode-name clips ("Max"/"Leo"/"Notes") cached on SD, played on switch. ---
+static const char *mode_word(buddy_mode_t m) { return m == MODE_MAX ? "Max" : m == MODE_LEO ? "Leo" : "Notes"; }
+static const char *mode_file(buddy_mode_t m)
+{
+    return m == MODE_MAX ? MODES_DIR "/max.pcm" : m == MODE_LEO ? MODES_DIR "/leo.pcm" : MODES_DIR "/notes.pcm";
+}
+
+// GET /modeclip?word=W (16 kHz mono PCM) and save it to `path` on SD.
+static bool download_modeclip(const char *word, const char *path)
+{
+    char url[200];
+    snprintf(url, sizeof(url), "%s/modeclip?word=%s", BUDDY_SERVER_URL, word);
+    esp_http_client_config_t cfg = {};
+    cfg.url = url;
+    cfg.method = HTTP_METHOD_GET;
+    cfg.timeout_ms = 15000;
+    esp_http_client_handle_t client = esp_http_client_init(&cfg);
+    esp_http_client_set_header(client, "X-Buddy-Token", BUDDY_TOKEN);
+    if (esp_http_client_open(client, 0) != ESP_OK) { esp_http_client_cleanup(client); return false; }
+    esp_http_client_fetch_headers(client);
+    int status = esp_http_client_get_status_code(client);
+    int total = 0, r;
+    if (status == 200) {
+        while (total < MODECLIP_BUF_BYTES &&
+               (r = esp_http_client_read(client, (char *)s_modeclip_buf + total, MODECLIP_BUF_BYTES - total)) > 0)
+            total += r;
+    }
+    esp_http_client_close(client);
+    esp_http_client_cleanup(client);
+    if (status != 200 || total <= 0) { ESP_LOGW(TAG, "modeclip %s: status %d", word, status); return false; }
+
+    bool ok = false;
+    xSemaphoreTake(s_sd_mux, portMAX_DELAY);
+    FILE *fp = fopen(path, "wb");
+    if (fp) { ok = (fwrite(s_modeclip_buf, 1, total, fp) == (size_t)total); fclose(fp); }
+    xSemaphoreGive(s_sd_mux);
+    ESP_LOGI(TAG, "modeclip %s -> %s (%d bytes) %s", word, path, total, ok ? "ok" : "FAIL");
+    return ok;
+}
+
+// At boot: ensure each mode-name clip exists on SD; fetch any missing (if online).
+static void ensure_mode_clips(void)
+{
+    if (!s_sd_ok || !s_modeclip_buf) return;
+    mkdir(MODES_DIR, 0777);
+    if (!espwifi_is_connected()) return;
+    buddy_mode_t modes[] = { MODE_MAX, MODE_LEO, MODE_AIR };
+    for (int i = 0; i < 3; i++) {
+        struct stat st;
+        if (stat(mode_file(modes[i]), &st) == 0 && st.st_size > 0) continue;
+        download_modeclip(mode_word(modes[i]), mode_file(modes[i]));
+    }
+}
+
+// Play the spoken name for `m` from SD. Returns false if unavailable (caller beeps).
+// Caller must hold s_audio_mux.
+static bool play_mode_clip(buddy_mode_t m)
+{
+    if (!s_sd_ok || !s_modeclip_buf) return false;
+    int total = 0;
+    xSemaphoreTake(s_sd_mux, portMAX_DELAY);
+    FILE *fp = fopen(mode_file(m), "rb");
+    if (fp) { total = (int)fread(s_modeclip_buf, 1, MODECLIP_BUF_BYTES, fp); fclose(fp); }
+    xSemaphoreGive(s_sd_mux);
+    if (total <= 0) return false;
+    play_pcm16(s_modeclip_buf, total, 1);  // 16 kHz mono -> stereo
+    return true;
 }
 
 // Create the queue dir and learn the pending count + next sequence number.
@@ -938,9 +1010,11 @@ static void pwr_button_task(void *arg)
             s_mode = (buddy_mode_t)((s_mode + 1) % 3);
             ESP_LOGI(TAG, "mode -> %s", mode_name());
             xSemaphoreTake(s_audio_mux, portMAX_DELAY);
-            if (s_mode == MODE_MAX)      { play_tone(1047, 110, 11000); }                          // Max: one high
-            else if (s_mode == MODE_LEO) { play_tone(1047, 70, 11000); play_tone(1319, 100, 11000); } // Leo: rising
-            else                         { play_tone(587, 150, 11000); }                           // Air: one low
+            if (!play_mode_clip(s_mode)) {  // speak the mode name; beep fallback if no clip
+                if (s_mode == MODE_MAX)      { play_tone(1047, 110, 11000); }
+                else if (s_mode == MODE_LEO) { play_tone(1047, 70, 11000); play_tone(1319, 100, 11000); }
+                else                         { play_tone(587, 150, 11000); }
+            }
             xSemaphoreGive(s_audio_mux);
             refresh_ctx_line();
             render_reply();   // clear the reply line in Notes mode; restore otherwise
@@ -983,7 +1057,8 @@ extern "C" void app_main(void)
     s_beep_buf = (uint8_t *)heap_caps_malloc(BEEP_BUF_BYTES, MALLOC_CAP_SPIRAM);
     s_tts_buf = (uint8_t *)heap_caps_malloc(MAX_TTS_BYTES, MALLOC_CAP_SPIRAM);
     s_tts_stereo = (uint8_t *)heap_caps_malloc(TTS_STEREO_FRAMES * BYTES_PER_FRAME, MALLOC_CAP_SPIRAM);
-    assert(rec && chunk && s_beep_buf && s_tts_buf && s_tts_stereo &&
+    s_modeclip_buf = (uint8_t *)heap_caps_malloc(MODECLIP_BUF_BYTES, MALLOC_CAP_SPIRAM);
+    assert(rec && chunk && s_beep_buf && s_tts_buf && s_tts_stereo && s_modeclip_buf &&
            "failed to allocate PSRAM buffers");
 
     s_audio_mux = xSemaphoreCreateMutex();
@@ -1002,6 +1077,7 @@ extern "C" void app_main(void)
         s_sd_mux = xSemaphoreCreateMutex();
         assert(s_sd_mux);
         queue_scan_init();
+        ensure_mode_clips();  // fetch spoken mode names to SD if missing
         refresh_ctx_line();  // show any pending-queue count at boot
         xTaskCreatePinnedToCore(drain_task, "drain", 6 * 1024, NULL, 2, NULL, 1);
     }

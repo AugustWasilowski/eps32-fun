@@ -33,7 +33,7 @@ from zoneinfo import ZoneInfo
 
 import httpx
 from fastapi import FastAPI, Header, HTTPException, Request
-from fastapi.responses import JSONResponse, PlainTextResponse
+from fastapi.responses import JSONResponse, PlainTextResponse, Response
 
 from usage import context_pct, token_usage_today
 from whisper import transcribe_wav
@@ -67,24 +67,32 @@ PIPER_URL = os.environ.get("PIPER_URL", "http://host.docker.internal:5050")
 SPEAK_REPLIES = os.environ.get("SPEAK_REPLIES", "1") == "1"
 
 
+MODECLIP_CACHE: dict[str, bytes] = {}
+
+
+async def synth_pcm16(text: str) -> bytes:
+    """Piper TTS -> 16 kHz mono 16-bit raw PCM (the buddy's playback format)."""
+    async with httpx.AsyncClient(timeout=30) as client:
+        r = await client.post(PIPER_URL, json={"text": text[:1000]})
+        r.raise_for_status()
+        wav_bytes = r.content
+    with wave.open(io.BytesIO(wav_bytes), "rb") as w:
+        rate, ch = w.getframerate(), w.getnchannels()
+        frames = w.readframes(w.getnframes())
+    if ch == 2:
+        frames = audioop.tomono(frames, 2, 0.5, 0.5)
+    pcm16k, _ = audioop.ratecv(frames, 2, 1, rate, 16000, None)
+    return pcm16k
+
+
 async def speak_on_buddy(text: str) -> None:
-    """Synthesize `text` with Piper and play it through the buddy's speaker.
-    Piper outputs 22050 Hz mono WAV; we resample to the buddy's 16 kHz (stdlib
-    audioop) and POST raw PCM to /play (which also shows the text on the e-paper)."""
+    """Synthesize `text` with Piper and play it through the buddy's speaker
+    (also shows the text on the e-paper via X-Buddy-Text)."""
     ip = STATE.get("buddy_ip")
     if not text or not ip:
         return
     try:
-        async with httpx.AsyncClient(timeout=30) as client:
-            r = await client.post(PIPER_URL, json={"text": text[:1000]})
-            r.raise_for_status()
-            wav_bytes = r.content
-        with wave.open(io.BytesIO(wav_bytes), "rb") as w:
-            rate, ch = w.getframerate(), w.getnchannels()
-            frames = w.readframes(w.getnframes())
-        if ch == 2:
-            frames = audioop.tomono(frames, 2, 0.5, 0.5)
-        pcm16k, _ = audioop.ratecv(frames, 2, 1, rate, 16000, None)
+        pcm16k = await synth_pcm16(text)
         hdr_text = text.replace("\n", " ").replace("\r", " ")[:200].encode("ascii", "ignore").decode()
         async with httpx.AsyncClient(timeout=30) as client:
             await client.post(
@@ -241,6 +249,19 @@ async def display(x_buddy_token: str | None = Header(default=None)):
             "max_reply": STATE["max_reply"],
         }
     )
+
+
+@app.get("/modeclip")
+async def modeclip(word: str = "", x_buddy_token: str | None = Header(default=None)):
+    """Return a short spoken word ("Max"/"Leo"/"Notes") as 16 kHz mono 16-bit raw
+    PCM, for the buddy to cache on SD and play on mode switches. Cached per word."""
+    _auth(x_buddy_token)
+    w = (word or "").strip()
+    if not w:
+        raise HTTPException(status_code=400, detail="word required")
+    if w not in MODECLIP_CACHE:
+        MODECLIP_CACHE[w] = await synth_pcm16(w)
+    return Response(content=MODECLIP_CACHE[w], media_type="application/octet-stream")
 
 
 @app.get("/healthz")
