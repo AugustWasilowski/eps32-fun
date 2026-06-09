@@ -393,17 +393,16 @@ static void battery_adc_init(void)
 static int battery_mv(void)
 {
     if (!s_adc) return -1;
-    // Divider is gated by GPIO17 (VBAT latch): pull low to connect it, sample,
-    // then restore the latch high. Short window so battery power isn't dropped.
+    // The divider is gated by GPIO17: pull low + settle + re-apply the channel
+    // (a plain read returns garbage), sample, then restore. Safe — USB-powered.
     gpio_set_level((gpio_num_t)VBAT_PWR_PIN, 0);
     vTaskDelay(pdMS_TO_TICKS(200));
-    // Re-apply the channel after the gate change (mirrors the working scan path).
     adc_oneshot_chan_cfg_t ccfg = {};
     ccfg.atten = ADC_ATTEN_DB_12;
     ccfg.bitwidth = ADC_BITWIDTH_12;
     adc_oneshot_config_channel(s_adc, ADC_CHANNEL_3, &ccfg);
     int dummy = 0;
-    adc_oneshot_read(s_adc, ADC_CHANNEL_3, &dummy);  // discard first (settle)
+    adc_oneshot_read(s_adc, ADC_CHANNEL_3, &dummy);  // discard one (settle)
     int acc = 0, n = 0;
     for (int i = 0; i < 8; i++) {
         int raw = 0;
@@ -414,7 +413,7 @@ static int battery_mv(void)
         acc += mv;
         n++;
     }
-    gpio_set_level((gpio_num_t)VBAT_PWR_PIN, 1);  // restore latch
+    gpio_set_level((gpio_num_t)VBAT_PWR_PIN, 1);  // restore gate (divider off)
     return n ? (acc / n) * 2 : -1;
 }
 
@@ -1110,15 +1109,6 @@ static void pwr_button_task(void *arg)
             xSemaphoreGive(s_audio_mux);
             refresh_ctx_line();
             render_reply();   // clear the reply line in Notes mode; restore otherwise
-        }
-        if (get_bit_button(e, 2)) {  // PWR long-press -> power off (cuts battery rail)
-            ESP_LOGW(TAG, "PWR long-press: powering off");
-            xSemaphoreTake(s_audio_mux, portMAX_DELAY);
-            play_tone(784, 90, 11000); play_tone(523, 130, 11000); play_tone(330, 220, 11000);
-            xSemaphoreGive(s_audio_mux);
-            vTaskDelay(pdMS_TO_TICKS(250));
-            user_power_off();
-            vTaskDelay(pdMS_TO_TICKS(3000));  // if still on USB power, don't spin
         }
     }
 }

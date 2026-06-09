@@ -28,7 +28,9 @@ void user_app_init(void)
     lvgl_button_groups = xEventGroupCreate();
 	audio_ptr = (uint8_t *)heap_caps_malloc(288 * 1000 * sizeof(uint8_t), MALLOC_CAP_SPIRAM);
 
-    board_div.VBAT_POWER_ON();   // latch the battery rail so we keep running off USB
+    board_div.VBAT_POWER_ON();   // GPIO17 high = battery sense divider gated off
+                                 // (low-power); battery_mv() pulses it low to read.
+                                 // NOTE: this is NOT a system power latch.
     board_div.POWEER_EPD_ON();
     board_div.POWEER_Audio_ON();
     i2c_master_Init();
