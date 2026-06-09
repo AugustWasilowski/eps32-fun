@@ -1,0 +1,30 @@
+services:
+  buddy-server:
+    build: .
+    container_name: claude-buddy-server
+    restart: unless-stopped
+    env_file: .env
+    ports:
+      - "8810:8810"
+    volumes:
+      # faster-whisper model cache (persists across rebuilds)
+      - buddy-models:/models
+      # read-only access to Claude data for token usage + context %
+      - ${HOME}/.claude:/root/.claude:ro
+    environment:
+      CLAUDE_DIR: /root/.claude
+    extra_hosts:
+      # lets the container reach the voice-channel running on the host
+      - "host.docker.internal:host-gateway"
+    # GPU for Whisper. Requires the NVIDIA container runtime (already used by
+    # immich_machine_learning on this host).
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+
+volumes:
+  buddy-models:

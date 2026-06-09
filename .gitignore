@@ -1,0 +1,26 @@
+# ---- ESP-IDF / firmware ----
+build/
+managed_components/
+sdkconfig
+sdkconfig.old
+*.bin
+*.elf
+*.map
+dependencies.lock
+# secrets copied from secrets.h.example
+**/secrets.h
+
+# ---- server (Python) ----
+__pycache__/
+*.pyc
+.venv/
+.env
+models/
+
+# ---- voice-channel (node/bun) ----
+node_modules/
+.env
+
+# ---- misc ----
+_waveshare_tmp/
+.DS_Store

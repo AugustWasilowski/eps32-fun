@@ -1,0 +1,6 @@
+{
+  "name": "voice-channel",
+  "description": "Voice channel — surfaces spoken input from the ESP32 e-paper buddy (Whisper-transcribed) as turns in the always-on ss-channels session.",
+  "version": "0.1.0",
+  "keywords": ["voice", "channel", "mcp", "esp32", "buddy"]
+}
