@@ -1,0 +1,6 @@
+{
+  "name": "leo-channel",
+  "description": "Voice buddy channel for Leo (Windows Claude Code). Bidirectional: surfaces voice turns and posts replies back via leo_chat_reply.",
+  "version": "0.1.0",
+  "keywords": ["voice", "buddy", "channel", "mcp"]
+}

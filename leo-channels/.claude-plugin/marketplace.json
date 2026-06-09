@@ -1,0 +1,16 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "leo-channels",
+  "description": "Local channels for Leo (the always-on Claude Code session on August's Windows PC).",
+  "owner": {
+    "name": "August Wasilowski"
+  },
+  "plugins": [
+    {
+      "name": "leo-channel",
+      "description": "ESP32 voice buddy -> Leo. Surfaces Whisper-transcribed voice (from the max server, target=leo) as turns; replies via leo_chat_reply.",
+      "source": "./leo-channel",
+      "category": "channels"
+    }
+  ]
+}
