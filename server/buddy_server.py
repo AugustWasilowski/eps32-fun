@@ -150,8 +150,9 @@ async def transcribe(
 
 @app.post("/chat_reply")
 async def chat_reply(request: Request, x_webhook_token: str | None = Header(default=None)):
-    """Receive Max's reply from ss-chat-channel (its ss_chat_reply -> reply_url)."""
-    if not x_webhook_token or x_webhook_token != SS_CHAT_TOKEN:
+    """Receive a reply from a channel (Max's ss_chat_reply or Leo's leo_chat_reply)."""
+    valid = {t for t in (SS_CHAT_TOKEN, LEO_CHANNEL_TOKEN) if t}
+    if not x_webhook_token or x_webhook_token not in valid:
         raise HTTPException(status_code=403, detail="forbidden")
     body = await request.json()
     STATE["max_reply"] = (body or {}).get("text", "") or ""
