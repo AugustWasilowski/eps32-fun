@@ -15,6 +15,8 @@
 #include <stdio.h>
 #include <math.h>
 #include <string.h>
+#include <dirent.h>
+#include <sys/stat.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/semphr.h"
@@ -33,6 +35,7 @@
 #include "user_app.h"
 #include "user_config.h"
 #include "audio_bsp.h"
+#include "button_bsp.h"   // pwr_groups event group (PWR button = airplane toggle)
 #include "esp_wifi_bsp.h"
 #include "gui_guider.h"   // LV_FONT_DECLARE(lv_font_Bold_20 / lv_font_montserratMedium_16)
 #include "secrets.h"
@@ -75,11 +78,25 @@ static lv_obj_t *s_lbl_max = NULL;   // Max's reply (wrapped, main content)
 
 // Last-rendered text per zone, so we only repaint (slow e-paper refresh) on change.
 static char s_last_tokens[64] = "";
-static char s_last_ctx[32] = "";
+static char s_last_ctx[48] = "";
 static char s_last_you[288] = "";
 static char s_last_max[320] = "";        // text currently shown on the "Max:" line
 static char s_last_server_max[320] = ""; // last max_reply seen from /display (so a
                                          // spoken /play text isn't clobbered by a poll)
+static int  s_last_ctx_val = -1;         // last bar value rendered
+
+// Buddy mode, cycled by the PWR button (shown on the Context line):
+//   Max = live send to Max's Claude session;  Leo = live send to Leo (this PC);
+//   Air = offline — queue to SD, drain later to whichever live mode is active.
+typedef enum { MODE_MAX = 0, MODE_LEO = 1, MODE_AIR = 2 } buddy_mode_t;
+static buddy_mode_t s_mode = MODE_MAX;
+static inline const char *mode_name(void)   { return s_mode == MODE_MAX ? "Max" : s_mode == MODE_LEO ? "Leo" : "AIR"; }
+static inline const char *mode_target(void) { return s_mode == MODE_LEO ? "leo" : "max"; }
+static inline bool mode_is_live(void)       { return s_mode != MODE_AIR; }
+
+static int  s_queue_count = 0;
+static char s_ctx_base[24] = "Context: --";  // "Context: NN%" from the last poll
+static int  s_ctx_val = 0;                    // context % for the bar
 
 // Flush LVGL's render buffer to the e-paper (full-screen partial refresh).
 // Identical pixel path to Waveshare's audio-test demo.
@@ -236,6 +253,31 @@ static void display_set_transcript(const char *txt)
     }
 }
 
+// Compose the "Context:" line (base % from poll + AIR/queue status) and update
+// the bar. Assumes the LVGL lock is held.
+static void refresh_ctx_line_locked(void)
+{
+    char suf[24];
+    if (s_queue_count > 0) snprintf(suf, sizeof(suf), "  %s q%d", mode_name(), s_queue_count);
+    else                   snprintf(suf, sizeof(suf), "  %s", mode_name());
+    char line[48];
+    snprintf(line, sizeof(line), "%s%s", s_ctx_base, suf);
+    if (strcmp(s_last_ctx, line) != 0) {
+        lv_label_set_text(s_lbl_ctx, line);
+        strncpy(s_last_ctx, line, sizeof(s_last_ctx) - 1);
+        s_last_ctx[sizeof(s_last_ctx) - 1] = '\0';
+    }
+    if (s_ctx_val != s_last_ctx_val) {
+        lv_bar_set_value(s_bar_ctx, s_ctx_val, LV_ANIM_OFF);
+        s_last_ctx_val = s_ctx_val;
+    }
+}
+
+static void refresh_ctx_line(void)
+{
+    if (lvgl_lock(1000)) { refresh_ctx_line_locked(); lvgl_unlock(); }
+}
+
 // Set the "Max:" line to spoken (/play) text. Does NOT touch s_last_server_max,
 // so the next /display poll won't clobber it unless Max's reply actually changes.
 static void display_set_max(const char *txt)
@@ -329,6 +371,7 @@ static void beep_stop(void)  { play_tone(660, 70, 12000); }                     
 static void beep_ok(void)    { play_tone(1047, 60, 12000); play_tone(1568, 90, 12000); } // rising: sent
 static void beep_fail(void)  { play_tone(330, 220, 12000); }                       // low long: failed
 static void beep_incoming(void) { play_tone(988, 70, 11000); play_tone(1319, 120, 11000); } // rising: incoming TTS
+static void beep_queued(void) { play_tone(784, 80, 11000); play_tone(587, 110, 11000); }     // descending: saved offline
 
 // POST a WAV to /transcribe. On HTTP 200, copies the transcript into out (size
 // out_sz) and returns the status code; returns negative on transport error.
@@ -344,8 +387,9 @@ static int post_wav(const uint8_t *wav, size_t wav_len, char *out, size_t out_sz
     esp_http_client_handle_t client = esp_http_client_init(&cfg);
     esp_http_client_set_header(client, "Content-Type", "audio/wav");
     esp_http_client_set_header(client, "X-Buddy-Token", BUDDY_TOKEN);
+    esp_http_client_set_header(client, "X-Buddy-Target", mode_target());
 
-    ESP_LOGI(TAG, "POST %s  (%u bytes)", url, (unsigned)wav_len);
+    ESP_LOGI(TAG, "POST %s  (%u bytes, target=%s)", url, (unsigned)wav_len, mode_target());
     esp_err_t err = esp_http_client_open(client, wav_len);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "http open failed: %s", esp_err_to_name(err));
@@ -376,21 +420,15 @@ static int post_wav(const uint8_t *wav, size_t wav_len, char *out, size_t out_sz
     return status;
 }
 
-// `rec` holds a reserved 44-byte WAV header followed by `mono_bytes` of mono PCM
-// (downmixed during capture). Fill the header and POST it; on success update the
-// transcript zone and poke the poll task. Returns HTTP status, 0 if not sent.
-static int send_recording(uint8_t *rec, size_t mono_bytes)
+// POST a complete WAV buffer (header + PCM) to /transcribe; on 200 show the
+// transcript and poke the poll task. Returns HTTP status (negative on error).
+static int post_and_show(uint8_t *wav, size_t wav_len)
 {
-    if (mono_bytes < MIN_SEND_MONO) { ESP_LOGW(TAG, "  too short (<0.25s) — not sending."); return 0; }
-    if (!espwifi_is_connected()) { ESP_LOGW(TAG, "  WiFi not connected — not sending."); return 0; }
-
-    write_wav_header(rec, mono_bytes, SAMPLE_RATE_HZ, 1, 16);
-
     char transcript[256];
-    int status = post_wav(rec, WAV_HDR_BYTES + mono_bytes, transcript, sizeof(transcript));
+    int status = post_wav(wav, wav_len, transcript, sizeof(transcript));
     if (status == 200) {
         display_set_transcript(transcript);
-        if (s_display_poke) xSemaphoreGive(s_display_poke);  // refresh tokens/context now
+        if (s_display_poke) xSemaphoreGive(s_display_poke);
     }
     return status;
 }
@@ -460,15 +498,15 @@ static void http_get_display(void)
         snprintf(tokens_str, sizeof(tokens_str), "Tokens: --");
     }
 
-    int ctx_val = 0;
-    char ctx_str[32];
     if (cJSON_IsNumber(j_ctx)) {
-        ctx_val = (int)(j_ctx->valuedouble + 0.5);
-        if (ctx_val < 0) ctx_val = 0;
-        if (ctx_val > 100) ctx_val = 100;
-        snprintf(ctx_str, sizeof(ctx_str), "Context: %d%%", ctx_val);
+        int v = (int)(j_ctx->valuedouble + 0.5);
+        if (v < 0) v = 0;
+        if (v > 100) v = 100;
+        s_ctx_val = v;
+        snprintf(s_ctx_base, sizeof(s_ctx_base), "Context: %d%%", v);
     } else {
-        snprintf(ctx_str, sizeof(ctx_str), "Context: --");
+        s_ctx_val = 0;
+        snprintf(s_ctx_base, sizeof(s_ctx_base), "Context: --");
     }
 
     const char *txt = (cJSON_IsString(j_txt) && j_txt->valuestring) ? j_txt->valuestring : "";
@@ -483,11 +521,7 @@ static void http_get_display(void)
             lv_label_set_text(s_lbl_tokens, tokens_str);
             strncpy(s_last_tokens, tokens_str, sizeof(s_last_tokens) - 1);
         }
-        if (strcmp(s_last_ctx, ctx_str) != 0) {
-            lv_label_set_text(s_lbl_ctx, ctx_str);
-            lv_bar_set_value(s_bar_ctx, ctx_val, LV_ANIM_OFF);
-            strncpy(s_last_ctx, ctx_str, sizeof(s_last_ctx) - 1);
-        }
+        refresh_ctx_line_locked();  // composes base % + AIR/queue status, updates bar
         if (strcmp(s_last_you, you_buf) != 0) {
             lv_label_set_text(s_lbl_you, you_buf);
             strncpy(s_last_you, you_buf, sizeof(s_last_you) - 1);
@@ -675,7 +709,10 @@ static void start_play_server(void)
 #define SD_CMD_PIN  GPIO_NUM_41
 #define SD_D0_PIN   GPIO_NUM_40
 #define SD_MOUNT    "/sdcard"
+#define QUEUE_DIR   SD_MOUNT "/queue"
 static bool s_sd_ok = false;
+static SemaphoreHandle_t s_sd_mux = NULL;   // serialize SD file ops
+static uint32_t s_next_seq = 0;             // next queue filename number
 
 static bool sdcard_mount(void)
 {
@@ -712,6 +749,161 @@ static void sdcard_selftest(void)
     f = fopen(SD_MOUNT "/buddy_test.txt", "r");
     if (f) { if (!fgets(line, sizeof(line), f)) line[0] = '\0'; fclose(f); }
     ESP_LOGI(TAG, "SD test: wrote+read back \"%s\"", line);
+}
+
+// Create the queue dir and learn the pending count + next sequence number.
+static void queue_scan_init(void)
+{
+    mkdir(QUEUE_DIR, 0777);
+    uint32_t next = 0;
+    int count = 0;
+    DIR *d = opendir(QUEUE_DIR);
+    if (d) {
+        struct dirent *e;
+        while ((e = readdir(d)) != NULL) {
+            unsigned n;
+            if (sscanf(e->d_name, "%u.wav", &n) == 1) {
+                count++;
+                if (n + 1 > next) next = n + 1;
+            }
+        }
+        closedir(d);
+    }
+    s_next_seq = next;
+    s_queue_count = count;
+    ESP_LOGI(TAG, "queue: %d pending, next seq %u", count, (unsigned)next);
+}
+
+// Save a complete WAV (header + PCM) to the SD queue for later upload.
+static bool save_to_queue(const uint8_t *wav, size_t len)
+{
+    if (!s_sd_ok) return false;
+    char path[64];
+    bool ok = false;
+    xSemaphoreTake(s_sd_mux, portMAX_DELAY);
+    snprintf(path, sizeof(path), QUEUE_DIR "/%06u.wav", (unsigned)s_next_seq);
+    FILE *fp = fopen(path, "wb");
+    if (fp) {
+        ok = (fwrite(wav, 1, len, fp) == len);
+        fclose(fp);
+    }
+    if (ok) { s_next_seq++; s_queue_count++; }
+    xSemaphoreGive(s_sd_mux);
+    if (ok) {
+        ESP_LOGI(TAG, "queued %s (%u bytes); %d pending", path, (unsigned)len, s_queue_count);
+        refresh_ctx_line();
+    } else {
+        ESP_LOGW(TAG, "queue write failed: %s", path);
+    }
+    return ok;
+}
+
+// Stream a queued WAV file to /transcribe (no big buffer). On 200, show the
+// transcript + poke. Returns HTTP status (negative on error).
+static int post_file_and_show(const char *path)
+{
+    struct stat st;
+    if (stat(path, &st) != 0 || st.st_size <= 0) return -1;
+    FILE *fp = fopen(path, "rb");
+    if (!fp) return -1;
+
+    char url[160];
+    snprintf(url, sizeof(url), "%s/transcribe", BUDDY_SERVER_URL);
+    esp_http_client_config_t cfg = {};
+    cfg.url = url;
+    cfg.method = HTTP_METHOD_POST;
+    cfg.timeout_ms = 20000;
+    esp_http_client_handle_t client = esp_http_client_init(&cfg);
+    esp_http_client_set_header(client, "Content-Type", "audio/wav");
+    esp_http_client_set_header(client, "X-Buddy-Token", BUDDY_TOKEN);
+    esp_http_client_set_header(client, "X-Buddy-Target", mode_target());
+
+    if (esp_http_client_open(client, st.st_size) != ESP_OK) {
+        fclose(fp); esp_http_client_cleanup(client); return -1;
+    }
+    uint8_t buf[2048];
+    size_t n;
+    bool werr = false;
+    while ((n = fread(buf, 1, sizeof(buf), fp)) > 0) {
+        if (esp_http_client_write(client, (char *)buf, n) < 0) { werr = true; break; }
+    }
+    fclose(fp);
+    if (werr) { esp_http_client_close(client); esp_http_client_cleanup(client); return -1; }
+
+    esp_http_client_fetch_headers(client);
+    int status = esp_http_client_get_status_code(client);
+    char resp[256];
+    int total = 0, r;
+    while (total < (int)sizeof(resp) - 1 &&
+           (r = esp_http_client_read(client, resp + total, sizeof(resp) - 1 - total)) > 0) {
+        total += r;
+    }
+    resp[total < 0 ? 0 : total] = '\0';
+    esp_http_client_close(client);
+    esp_http_client_cleanup(client);
+
+    if (status == 200) {
+        display_set_transcript(resp);
+        if (s_display_poke) xSemaphoreGive(s_display_poke);
+        ESP_LOGI(TAG, "drained %s -> \"%s\"", path, resp);
+    } else {
+        ESP_LOGW(TAG, "drain %s: status %d", path, status);
+    }
+    return status;
+}
+
+// Uploads queued recordings oldest-first whenever online and not in airplane mode.
+static void drain_task(void *arg)
+{
+    for (;;) {
+        if (s_sd_ok && s_queue_count > 0 && mode_is_live() && espwifi_is_connected()) {
+            unsigned oldest_n = 0xffffffffu;
+            xSemaphoreTake(s_sd_mux, portMAX_DELAY);
+            DIR *d = opendir(QUEUE_DIR);
+            if (d) {
+                struct dirent *e;
+                while ((e = readdir(d)) != NULL) {
+                    unsigned n;
+                    if (sscanf(e->d_name, "%u.wav", &n) == 1 && n < oldest_n) oldest_n = n;
+                }
+                closedir(d);
+            }
+            xSemaphoreGive(s_sd_mux);
+
+            if (oldest_n != 0xffffffffu) {
+                char path[64];
+                snprintf(path, sizeof(path), QUEUE_DIR "/%06u.wav", oldest_n);
+                if (post_file_and_show(path) == 200) {
+                    xSemaphoreTake(s_sd_mux, portMAX_DELAY);
+                    remove(path);
+                    if (s_queue_count > 0) s_queue_count--;
+                    xSemaphoreGive(s_sd_mux);
+                    refresh_ctx_line();
+                    vTaskDelay(pdMS_TO_TICKS(400));  // brief gap, then next file
+                    continue;
+                }
+            }
+        }
+        vTaskDelay(pdMS_TO_TICKS(5000));
+    }
+}
+
+// PWR button (single click) cycles the mode: Max -> Leo -> Air -> Max.
+static void pwr_button_task(void *arg)
+{
+    for (;;) {
+        EventBits_t e = xEventGroupWaitBits(pwr_groups, set_bit_all, pdTRUE, pdFALSE, portMAX_DELAY);
+        if (get_bit_button(e, 0)) {  // single click
+            s_mode = (buddy_mode_t)((s_mode + 1) % 3);
+            ESP_LOGI(TAG, "mode -> %s", mode_name());
+            xSemaphoreTake(s_audio_mux, portMAX_DELAY);
+            if (s_mode == MODE_MAX)      { play_tone(1047, 110, 11000); }                          // Max: one high
+            else if (s_mode == MODE_LEO) { play_tone(1047, 70, 11000); play_tone(1319, 100, 11000); } // Leo: rising
+            else                         { play_tone(587, 150, 11000); }                           // Air: one low
+            xSemaphoreGive(s_audio_mux);
+            refresh_ctx_line();
+        }
+    }
 }
 
 // ============================ app_main ============================
@@ -759,6 +951,17 @@ extern "C" void app_main(void)
     assert(s_display_poke);
     xTaskCreatePinnedToCore(display_poll_task, "display_poll", 6 * 1024, NULL, 3, NULL, 1);
 
+    // Offline capture: scan the SD queue and start the background drain task.
+    if (s_sd_ok) {
+        s_sd_mux = xSemaphoreCreateMutex();
+        assert(s_sd_mux);
+        queue_scan_init();
+        refresh_ctx_line();  // show any pending-queue count at boot
+        xTaskCreatePinnedToCore(drain_task, "drain", 6 * 1024, NULL, 2, NULL, 1);
+    }
+    // PWR button toggles airplane mode (defer uploads).
+    xTaskCreatePinnedToCore(pwr_button_task, "pwr_btn", 3 * 1024, NULL, 4, NULL, 1);
+
     ESP_LOGI(TAG, "Ready. Hold BOOT (GPIO%d) and speak (up to %ds); release to stop.",
              BOOT_BUTTON_PIN, MAX_RECORD_SEC);
 
@@ -792,9 +995,24 @@ extern "C" void app_main(void)
                  (float)mono_bytes / MONO_BYTES_PER_SEC, (unsigned)mono_bytes, peak_rms);
         beep_stop();
 
-        int status = send_recording(rec, mono_bytes);
-        if (status == 200) beep_ok();
-        else               beep_fail();
+        if (mono_bytes < MIN_SEND_MONO) {
+            ESP_LOGW(TAG, "  too short (<0.25s) — discarding.");
+            beep_fail();
+        } else {
+            write_wav_header(rec, mono_bytes, SAMPLE_RATE_HZ, 1, 16);
+            size_t wav_len = WAV_HDR_BYTES + mono_bytes;
+            bool sent = false;
+            if (mode_is_live() && espwifi_is_connected()) {
+                sent = (post_and_show(rec, wav_len) == 200);  // live: send to Max/Leo now
+            }
+            if (sent) {
+                beep_ok();
+            } else if (s_sd_ok && save_to_queue(rec, wav_len)) {
+                beep_queued();   // offline/air/failed → saved on SD for later
+            } else {
+                beep_fail();
+            }
+        }
         xSemaphoreGive(s_audio_mux);
 
         vTaskDelay(pdMS_TO_TICKS(150));  // debounce release edge

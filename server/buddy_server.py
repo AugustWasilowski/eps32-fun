@@ -44,6 +44,32 @@ SS_CHAT_TOKEN = os.environ.get("SS_CHAT_TOKEN", "")
 # so localhost:8810 reaches us from the host where the channel runs.
 SELF_REPLY_URL = os.environ.get("SELF_REPLY_URL", "http://localhost:8810/chat_reply")
 
+# Leo target (a second Claude Code on August's Windows PC). Its channel runs on
+# that PC; reply_url must be how Leo's PC reaches THIS server (max's LAN IP).
+LEO_CHANNEL_URL = os.environ.get("LEO_CHANNEL_URL", "")
+LEO_CHANNEL_TOKEN = os.environ.get("LEO_CHANNEL_TOKEN", "")
+LEO_REPLY_URL = os.environ.get("LEO_REPLY_URL", "")
+
+
+async def _deliver(text: str, target: str) -> None:
+    """Forward a transcript into the chosen assistant's channel."""
+    if target == "leo":
+        url, token, reply = LEO_CHANNEL_URL, LEO_CHANNEL_TOKEN, LEO_REPLY_URL
+    else:
+        url, token, reply = SS_CHAT_CHANNEL_URL, SS_CHAT_TOKEN, SELF_REPLY_URL
+    if not text or not url or not token:
+        if target == "leo":
+            print("[buddy] leo target but LEO_CHANNEL_URL/TOKEN not set — not delivered")
+        return
+    payload = {"request_id": "voice-" + uuid.uuid4().hex[:12], "text": f"[voice] {text}", "host": "max"}
+    if reply:
+        payload["reply_url"] = reply
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            await client.post(url, json=payload, headers={"X-Webhook-Token": token})
+    except Exception as exc:  # noqa: BLE001 — never fail the device on a delivery hiccup
+        print(f"[buddy] {target}-channel post failed: {exc}")
+
 app = FastAPI(title="claude-buddy")
 
 # Tiny in-memory state: the most recent transcript, Max's reply, and where to
@@ -57,7 +83,11 @@ def _auth(token: str | None) -> None:
 
 
 @app.post("/transcribe")
-async def transcribe(request: Request, x_buddy_token: str | None = Header(default=None)):
+async def transcribe(
+    request: Request,
+    x_buddy_token: str | None = Header(default=None),
+    x_buddy_target: str | None = Header(default=None),
+):
     _auth(x_buddy_token)
 
     audio = await request.body()
@@ -74,24 +104,10 @@ async def transcribe(request: Request, x_buddy_token: str | None = Header(defaul
 
     STATE["last_transcript"] = text
 
-    # Surface it in Max's session via ss-chat-channel (request_id correlates Max's
-    # reply, which routes back to /chat_reply via reply_url).
-    if text and SS_CHAT_TOKEN:
-        request_id = "voice-" + uuid.uuid4().hex[:12]
-        try:
-            async with httpx.AsyncClient(timeout=10) as client:
-                await client.post(
-                    SS_CHAT_CHANNEL_URL,
-                    json={
-                        "request_id": request_id,
-                        "text": f"[voice] {text}",
-                        "host": "max",
-                        "reply_url": SELF_REPLY_URL,
-                    },
-                    headers={"X-Webhook-Token": SS_CHAT_TOKEN},
-                )
-        except Exception as exc:  # noqa: BLE001 — never fail the device on a delivery hiccup
-            print(f"[buddy] ss-chat-channel post failed: {exc}")
+    # Route into the chosen assistant's channel (default: Max). The reply routes
+    # back to /chat_reply via the channel's reply_url.
+    target = (x_buddy_target or "max").lower()
+    await _deliver(text, target)
 
     return PlainTextResponse(text)
 
