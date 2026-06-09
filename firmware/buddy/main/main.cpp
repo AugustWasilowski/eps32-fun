@@ -43,12 +43,14 @@ static const char *TAG = "buddy";
 #define BYTES_PER_FRAME  (NUM_CHANNELS * BYTES_PER_SAMPLE)        // 4 bytes (L+R)
 #define BYTES_PER_SEC    (SAMPLE_RATE_HZ * BYTES_PER_FRAME)       // 64000 B/s
 
-#define CHUNK_BYTES      (BYTES_PER_SEC / 8)                      // 8000 B (~0.125 s)
-#define MAX_RECORD_SEC   10
-#define RECORD_BUF_BYTES (MAX_RECORD_SEC * BYTES_PER_SEC)         // 640000 B (stereo)
-#define WAV_HDR_BYTES    44
-#define WAV_BUF_BYTES    (WAV_HDR_BYTES + RECORD_BUF_BYTES / 2)   // mono + header
-#define MIN_SEND_BYTES   (BYTES_PER_SEC / 4)                      // 0.25 s stereo
+#define CHUNK_BYTES        (BYTES_PER_SEC / 8)                    // 8000 B stereo (~0.125 s)
+#define MAX_RECORD_SEC     60
+#define MONO_BYTES_PER_SEC (SAMPLE_RATE_HZ * BYTES_PER_SAMPLE)    // 32000 B/s mono
+#define REC_MONO_BYTES     (MAX_RECORD_SEC * MONO_BYTES_PER_SEC)  // mono PCM capacity
+#define WAV_HDR_BYTES      44
+// Single capture buffer: 44-byte WAV header + mono PCM (we downmix on the fly).
+#define REC_BUF_BYTES      (WAV_HDR_BYTES + REC_MONO_BYTES)
+#define MIN_SEND_MONO      (MONO_BYTES_PER_SEC / 4)               // 0.25 s mono
 
 // One automatic record+POST at boot (no button) to validate the HTTP path.
 // Set to 0 once the device->server path is confirmed.
@@ -371,45 +373,23 @@ static int post_wav(const uint8_t *wav, size_t wav_len, char *out, size_t out_sz
     return status;
 }
 
-// Downmix stereo->mono, wrap in WAV, POST, and on success update the transcript
-// zone and poke the display poll task to refresh usage/context. Returns the HTTP
-// status (200 on success), or 0 if it didn't send, or negative on transport error.
-static int send_recording(const uint8_t *record_buf, size_t total, uint8_t *wav_buf)
+// `rec` holds a reserved 44-byte WAV header followed by `mono_bytes` of mono PCM
+// (downmixed during capture). Fill the header and POST it; on success update the
+// transcript zone and poke the poll task. Returns HTTP status, 0 if not sent.
+static int send_recording(uint8_t *rec, size_t mono_bytes)
 {
-    if (total < MIN_SEND_BYTES) { ESP_LOGW(TAG, "  too short (<0.25s) — not sending."); return 0; }
+    if (mono_bytes < MIN_SEND_MONO) { ESP_LOGW(TAG, "  too short (<0.25s) — not sending."); return 0; }
     if (!espwifi_is_connected()) { ESP_LOGW(TAG, "  WiFi not connected — not sending."); return 0; }
 
-    size_t frames = total / BYTES_PER_FRAME;
-    const int16_t *src = (const int16_t *)record_buf;
-    int16_t *dst = (int16_t *)(wav_buf + WAV_HDR_BYTES);
-    for (size_t i = 0; i < frames; i++) {
-        int32_t l = src[2 * i], rr = src[2 * i + 1];
-        dst[i] = (int16_t)((l + rr) / 2);
-    }
-    size_t mono_bytes = frames * BYTES_PER_SAMPLE;
-    write_wav_header(wav_buf, mono_bytes, SAMPLE_RATE_HZ, 1, 16);
+    write_wav_header(rec, mono_bytes, SAMPLE_RATE_HZ, 1, 16);
 
     char transcript[256];
-    int status = post_wav(wav_buf, WAV_HDR_BYTES + mono_bytes, transcript, sizeof(transcript));
+    int status = post_wav(rec, WAV_HDR_BYTES + mono_bytes, transcript, sizeof(transcript));
     if (status == 200) {
         display_set_transcript(transcript);
         if (s_display_poke) xSemaphoreGive(s_display_poke);  // refresh tokens/context now
     }
     return status;
-}
-
-static size_t capture_bytes(uint8_t *record_buf, uint8_t *chunk, size_t want)
-{
-    if (want > RECORD_BUF_BYTES) want = RECORD_BUF_BYTES;
-    size_t got = 0;
-    while (got < want) {
-        size_t n = CHUNK_BYTES;
-        if (got + n > want) n = want - got;
-        audio_playback_read(chunk, n);
-        memcpy(record_buf + got, chunk, n);
-        got += n;
-    }
-    return got;
 }
 
 // Abbreviate large counts so they fit the 200px panel (123456 -> "123.5k").
@@ -706,13 +686,14 @@ extern "C" void app_main(void)
         ESP_LOGW(TAG, "WiFi NOT connected within 20s — will keep retrying in background.");
     }
 
-    uint8_t *record_buf = (uint8_t *)heap_caps_malloc(RECORD_BUF_BYTES, MALLOC_CAP_SPIRAM);
+    // Single mono capture buffer (44-byte WAV header reserved up front) + a small
+    // stereo read chunk. We downmix stereo->mono on the fly during capture.
+    uint8_t *rec = (uint8_t *)heap_caps_malloc(REC_BUF_BYTES, MALLOC_CAP_SPIRAM);
     uint8_t *chunk = (uint8_t *)heap_caps_malloc(CHUNK_BYTES, MALLOC_CAP_SPIRAM);
-    uint8_t *wav_buf = (uint8_t *)heap_caps_malloc(WAV_BUF_BYTES, MALLOC_CAP_SPIRAM);
     s_beep_buf = (uint8_t *)heap_caps_malloc(BEEP_BUF_BYTES, MALLOC_CAP_SPIRAM);
     s_tts_buf = (uint8_t *)heap_caps_malloc(MAX_TTS_BYTES, MALLOC_CAP_SPIRAM);
     s_tts_stereo = (uint8_t *)heap_caps_malloc(TTS_STEREO_FRAMES * BYTES_PER_FRAME, MALLOC_CAP_SPIRAM);
-    assert(record_buf && chunk && wav_buf && s_beep_buf && s_tts_buf && s_tts_stereo &&
+    assert(rec && chunk && s_beep_buf && s_tts_buf && s_tts_stereo &&
            "failed to allocate PSRAM buffers");
 
     s_audio_mux = xSemaphoreCreateMutex();
@@ -726,19 +707,10 @@ extern "C" void app_main(void)
     assert(s_display_poke);
     xTaskCreatePinnedToCore(display_poll_task, "display_poll", 6 * 1024, NULL, 3, NULL, 1);
 
-#if SELFTEST_AT_BOOT
-    if (espwifi_is_connected()) {
-        ESP_LOGI(TAG, "SELF-TEST: recording ~1s and POSTing (no button needed)...");
-        size_t got = capture_bytes(record_buf, chunk, SAMPLE_RATE_HZ * BYTES_PER_FRAME);
-        ESP_LOGI(TAG, "SELF-TEST: captured %u bytes, rms=%.0f", (unsigned)got, rms_int16(record_buf, got));
-        send_recording(record_buf, got, wav_buf);
-    }
-#else
-    (void)capture_bytes; (void)rms_int16;  // referenced by self-test / PTT only
-#endif
+    ESP_LOGI(TAG, "Ready. Hold BOOT (GPIO%d) and speak (up to %ds); release to stop.",
+             BOOT_BUTTON_PIN, MAX_RECORD_SEC);
 
-    ESP_LOGI(TAG, "Ready. Hold BOOT (GPIO%d) and speak; release to stop.", BOOT_BUTTON_PIN);
-
+    const size_t max_samples = REC_MONO_BYTES / BYTES_PER_SAMPLE;
     for (;;) {
         if (!ptt_pressed()) {
             vTaskDelay(pdMS_TO_TICKS(20));
@@ -748,22 +720,27 @@ extern "C" void app_main(void)
         xSemaphoreTake(s_audio_mux, portMAX_DELAY);
         ESP_LOGI(TAG, "REC start");
         beep_start();
-        size_t total = 0;
+
+        int16_t *dst = (int16_t *)(rec + WAV_HDR_BYTES);
+        size_t mono_samples = 0;
         double peak_rms = 0.0;
-        while (ptt_pressed() && total < RECORD_BUF_BYTES) {
-            size_t want = CHUNK_BYTES;
-            if (total + want > RECORD_BUF_BYTES) want = RECORD_BUF_BYTES - total;
-            audio_playback_read(chunk, want);
-            memcpy(record_buf + total, chunk, want);
-            total += want;
-            double r = rms_int16(chunk, want);
-            if (r > peak_rms) peak_rms = r;
+        while (ptt_pressed() && mono_samples < max_samples) {
+            audio_playback_read(chunk, CHUNK_BYTES);          // interleaved stereo
+            const int16_t *src = (const int16_t *)chunk;
+            size_t frames = CHUNK_BYTES / BYTES_PER_FRAME;
+            for (size_t i = 0; i < frames && mono_samples < max_samples; i++) {
+                int32_t l = src[2 * i], r = src[2 * i + 1];
+                dst[mono_samples++] = (int16_t)((l + r) / 2);  // downmix to mono
+            }
+            double rr = rms_int16(chunk, CHUNK_BYTES);
+            if (rr > peak_rms) peak_rms = rr;
         }
-        ESP_LOGI(TAG, "REC done: %.2f s, %u bytes, peak rms=%.0f",
-                 (float)total / BYTES_PER_SEC, (unsigned)total, peak_rms);
+        size_t mono_bytes = mono_samples * BYTES_PER_SAMPLE;
+        ESP_LOGI(TAG, "REC done: %.2f s, %u mono bytes, peak rms=%.0f",
+                 (float)mono_bytes / MONO_BYTES_PER_SEC, (unsigned)mono_bytes, peak_rms);
         beep_stop();
 
-        int status = send_recording(record_buf, total, wav_buf);
+        int status = send_recording(rec, mono_bytes);
         if (status == 200) beep_ok();
         else               beep_fail();
         xSemaphoreGive(s_audio_mux);
