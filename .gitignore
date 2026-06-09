@@ -24,3 +24,9 @@ node_modules/
 # ---- misc ----
 _waveshare_tmp/
 .DS_Store
+
+# ---- dev artifacts ----
+*.bak
+firmware/buddy/tools/recv/
+.vscode/
+.clangd
