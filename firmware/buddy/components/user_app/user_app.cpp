@@ -28,9 +28,29 @@ void user_app_init(void)
     lvgl_button_groups = xEventGroupCreate();
 	audio_ptr = (uint8_t *)heap_caps_malloc(288 * 1000 * sizeof(uint8_t), MALLOC_CAP_SPIRAM);
 
-    board_div.VBAT_POWER_ON();   // GPIO17 high = battery sense divider gated off
-                                 // (low-power); battery_mv() pulses it low to read.
-                                 // NOTE: this is NOT a system power latch.
+    board_div.VBAT_POWER_ON();   // GPIO17 (BAT_Control) HIGH = assert the power-hold
+                                 // latch so the board keeps running on battery. LOW
+                                 // releases it = power off (on USB, VBUS holds VSYS via
+                                 // D4 so a low does nothing).
+
+    // Battery cold-start: the user powers on by HOLDING PWR. The latch is now asserted,
+    // so wait for them to release PWR before continuing (mirrors Waveshare's factory
+    // boot). On USB boot PWR isn't pressed, so this falls straight through. Bounded so
+    // a stuck/held button can never hang boot.
+    {
+        gpio_config_t pwr_in = {};
+        pwr_in.intr_type = GPIO_INTR_DISABLE;
+        pwr_in.mode = GPIO_MODE_INPUT;
+        pwr_in.pin_bit_mask = (0x1ULL << PWR_BUTTON_PIN);
+        pwr_in.pull_up_en = GPIO_PULLUP_ENABLE;
+        gpio_config(&pwr_in);
+        int waited_ms = 0;
+        while (gpio_get_level((gpio_num_t)PWR_BUTTON_PIN) == 0 && waited_ms < 5000) {
+            vTaskDelay(pdMS_TO_TICKS(50));
+            waited_ms += 50;
+        }
+    }
+
     board_div.POWEER_EPD_ON();
     board_div.POWEER_Audio_ON();
     i2c_master_Init();

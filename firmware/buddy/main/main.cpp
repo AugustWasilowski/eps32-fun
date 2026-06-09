@@ -1,8 +1,10 @@
 // Claude Buddy firmware — Stage 3: PTT mic -> WAV -> POST  +  e-paper display.
 //
-// Push-to-talk: hold BOOT (GPIO0), speak, release -> record from the ES8311 mic,
-// downmix stereo->mono, wrap in a WAV header, POST to ${BUDDY_SERVER_URL}/transcribe
-// (X-Buddy-Token). The plain-text response is the transcript.
+// BOOT (GPIO0) is the only UI button: a quick TAP cycles the mode (Max/Leo/Notes),
+// a HOLD is push-to-talk — speak, release -> record from the ES8311 mic, downmix
+// stereo->mono, wrap in a WAV header, POST to ${BUDDY_SERVER_URL}/transcribe
+// (X-Buddy-Token). The plain-text response is the transcript. The PWR button is left
+// to its hardware power role and is not used by firmware.
 //
 // Display: a 3-zone LVGL UI on the 200x200 e-paper — token usage (top), context-%
 // bar (middle), last transcript (bottom, word-wrapped). A poll task GETs
@@ -40,7 +42,7 @@
 #include "user_app.h"
 #include "user_config.h"
 #include "audio_bsp.h"
-#include "button_bsp.h"   // pwr_groups event group (PWR button = airplane toggle)
+#include "button_bsp.h"   // pwr_groups event group (PWR button = power on/off)
 #include "esp_wifi_bsp.h"
 #include "gui_guider.h"   // LV_FONT_DECLARE(lv_font_Bold_20 / lv_font_montserratMedium_16)
 #include "secrets.h"
@@ -367,8 +369,10 @@ static long long now_epoch(void)
     return (t > 1000000000) ? (long long)t : 0;
 }
 
-// --- Battery: ADC1 ch3 (GPIO4), 12-bit, 12dB; volts = read x2. Divider is gated by
-// GPIO17 (VBAT): must be LOW to read, so we pulse it low during the measurement. ---
+// --- Battery: ADC1 ch3 (GPIO4 = BAT_ADC), 12-bit, 12dB; volts = read x2 (R21/R38
+// 200K/200K divider). The divider is ALWAYS connected — it is NOT gated. GPIO17 is
+// BAT_Control, the soft power-latch (HIGH = hold power on battery, LOW = power off);
+// it must NEVER be touched here or we drop the latch and kill the board on battery. ---
 static adc_oneshot_unit_handle_t s_adc = NULL;
 static adc_cali_handle_t s_adc_cali = NULL;
 
@@ -393,14 +397,8 @@ static void battery_adc_init(void)
 static int battery_mv(void)
 {
     if (!s_adc) return -1;
-    // The divider is gated by GPIO17: pull low + settle + re-apply the channel
-    // (a plain read returns garbage), sample, then restore. Safe — USB-powered.
-    gpio_set_level((gpio_num_t)VBAT_PWR_PIN, 0);
-    vTaskDelay(pdMS_TO_TICKS(200));
-    adc_oneshot_chan_cfg_t ccfg = {};
-    ccfg.atten = ADC_ATTEN_DB_12;
-    ccfg.bitwidth = ADC_BITWIDTH_12;
-    adc_oneshot_config_channel(s_adc, ADC_CHANNEL_3, &ccfg);
+    // BAT_ADC (GPIO4/CH3) is an always-on divider — just sample it. Do NOT touch
+    // GPIO17 (BAT_Control): it is the power-hold latch, not a divider gate.
     int dummy = 0;
     adc_oneshot_read(s_adc, ADC_CHANNEL_3, &dummy);  // discard one (settle)
     int acc = 0, n = 0;
@@ -413,7 +411,6 @@ static int battery_mv(void)
         acc += mv;
         n++;
     }
-    gpio_set_level((gpio_num_t)VBAT_PWR_PIN, 1);  // restore gate (divider off)
     return n ? (acc / n) * 2 : -1;
 }
 
@@ -1092,23 +1089,37 @@ static void drain_task(void *arg)
     }
 }
 
-// PWR button (single click) cycles the mode: Max -> Leo -> Air -> Max.
-static void pwr_button_task(void *arg)
+// Advance Max -> Leo -> Notes -> Max and announce it (spoken clip, beep fallback).
+// Triggered by a short tap of the BOOT button (holding BOOT records instead).
+static void cycle_mode(void)
+{
+    s_mode = (buddy_mode_t)((s_mode + 1) % 3);
+    ESP_LOGI(TAG, "mode -> %s", mode_name());
+    xSemaphoreTake(s_audio_mux, portMAX_DELAY);
+    if (!play_mode_clip(s_mode)) {  // speak the mode name; beep fallback if no clip
+        if (s_mode == MODE_MAX)      { play_tone(1047, 110, 11000); }
+        else if (s_mode == MODE_LEO) { play_tone(1047, 70, 11000); play_tone(1319, 100, 11000); }
+        else                         { play_tone(587, 150, 11000); }
+    }
+    xSemaphoreGive(s_audio_mux);
+    refresh_ctx_line();
+    render_reply();   // clear the reply line in Notes mode; restore otherwise
+}
+
+// PWR button: a long-press powers the board off by releasing the GP17 latch
+// (user_power_off -> VBAT_POWER_OFF). This only actually cuts power on battery; on USB
+// the board stays up (VBUS holds VSYS), so the task simply loops and waits again.
+static void pwr_power_task(void *arg)
 {
     for (;;) {
         EventBits_t e = xEventGroupWaitBits(pwr_groups, set_bit_all, pdTRUE, pdFALSE, portMAX_DELAY);
-        if (get_bit_button(e, 0)) {  // single click
-            s_mode = (buddy_mode_t)((s_mode + 1) % 3);
-            ESP_LOGI(TAG, "mode -> %s", mode_name());
+        if (get_bit_button(e, 2)) {   // long press
+            ESP_LOGI(TAG, "PWR long-press -> power off");
             xSemaphoreTake(s_audio_mux, portMAX_DELAY);
-            if (!play_mode_clip(s_mode)) {  // speak the mode name; beep fallback if no clip
-                if (s_mode == MODE_MAX)      { play_tone(1047, 110, 11000); }
-                else if (s_mode == MODE_LEO) { play_tone(1047, 70, 11000); play_tone(1319, 100, 11000); }
-                else                         { play_tone(587, 150, 11000); }
-            }
+            play_tone(784, 120, 11000);         // descending "power off" chirp
+            play_tone(523, 180, 11000);
             xSemaphoreGive(s_audio_mux);
-            refresh_ctx_line();
-            render_reply();   // clear the reply line in Notes mode; restore otherwise
+            user_power_off();                   // GP17 low -> latch released (off on battery)
         }
     }
 }
@@ -1182,18 +1193,31 @@ extern "C" void app_main(void)
         refresh_ctx_line();  // show any pending-queue count at boot
         xTaskCreatePinnedToCore(drain_task, "drain", 6 * 1024, NULL, 2, NULL, 1);
     }
-    // PWR button toggles airplane mode (defer uploads).
-    xTaskCreatePinnedToCore(pwr_button_task, "pwr_btn", 3 * 1024, NULL, 4, NULL, 1);
+    // Modes are switched with a short tap of BOOT (handled in the loop below).
+    // The PWR button now does power only: long-press = power off (drops the GP17 latch).
+    xTaskCreatePinnedToCore(pwr_power_task, "pwr_pwr", 3 * 1024, NULL, 4, NULL, 1);
 
-    ESP_LOGI(TAG, "Ready. Hold BOOT (GPIO%d) and speak (up to %ds); release to stop.",
+    ESP_LOGI(TAG, "Ready. Tap BOOT (GPIO%d) to switch mode; hold to record (up to %ds), release to send.",
              BOOT_BUTTON_PIN, MAX_RECORD_SEC);
 
     const size_t max_samples = REC_MONO_BYTES / BYTES_PER_SAMPLE;
+    const int64_t HOLD_US = 300000;  // BOOT held >=300ms records; a shorter tap cycles the mode
     for (;;) {
         if (!ptt_pressed()) {
             vTaskDelay(pdMS_TO_TICKS(20));
             continue;
         }
+        // BOOT is down: distinguish a quick tap (switch mode) from a hold (record).
+        int64_t t0 = esp_timer_get_time();
+        while (ptt_pressed() && (esp_timer_get_time() - t0) < HOLD_US) {
+            vTaskDelay(pdMS_TO_TICKS(10));
+        }
+        if (!ptt_pressed()) {                 // released before threshold -> tap
+            cycle_mode();
+            vTaskDelay(pdMS_TO_TICKS(150));   // debounce release
+            continue;
+        }
+        // Held past the threshold -> record.
         // Hold the codec for the whole cycle so an incoming /play can't interleave.
         xSemaphoreTake(s_audio_mux, portMAX_DELAY);
         ESP_LOGI(TAG, "REC start");
