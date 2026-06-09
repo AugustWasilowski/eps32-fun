@@ -46,8 +46,9 @@ SELF_REPLY_URL = os.environ.get("SELF_REPLY_URL", "http://localhost:8810/chat_re
 
 app = FastAPI(title="claude-buddy")
 
-# Tiny in-memory state: the most recent transcript and Max's most recent reply.
-STATE = {"last_transcript": "", "max_reply": ""}
+# Tiny in-memory state: the most recent transcript, Max's reply, and where to
+# reach the buddy's /play server (it registers its DHCP IP on boot / each poll).
+STATE = {"last_transcript": "", "max_reply": "", "buddy_ip": "", "buddy_port": 8080}
 
 
 def _auth(token: str | None) -> None:
@@ -103,6 +104,29 @@ async def chat_reply(request: Request, x_webhook_token: str | None = Header(defa
     body = await request.json()
     STATE["max_reply"] = (body or {}).get("text", "") or ""
     return JSONResponse({"ok": True})
+
+
+@app.post("/register")
+async def register(request: Request, x_buddy_token: str | None = Header(default=None)):
+    """The buddy reports its (DHCP) IP + /play port so TTS senders know where to go."""
+    _auth(x_buddy_token)
+    body = await request.json()
+    ip = (body or {}).get("ip", "")
+    if not ip:
+        raise HTTPException(status_code=400, detail="ip required")
+    STATE["buddy_ip"] = ip
+    STATE["buddy_port"] = int((body or {}).get("port", 8080))
+    return JSONResponse({"ok": True})
+
+
+@app.get("/buddy")
+async def buddy(x_buddy_token: str | None = Header(default=None)):
+    """Where to reach the buddy's /play endpoint (for Piper TTS senders on max)."""
+    _auth(x_buddy_token)
+    ip, port = STATE["buddy_ip"], STATE["buddy_port"]
+    return JSONResponse(
+        {"ip": ip, "port": port, "play_url": f"http://{ip}:{port}/play" if ip else ""}
+    )
 
 
 @app.get("/display")

@@ -75,6 +75,12 @@ and validated on the real board:
   (CONTEXT_WINDOW=1000000 for Max's 1M model).
 - Delivery into Max via ss-chat-channel works (see RESOLVED section below); Max's reply comes back
   as `max_reply` on `/display`.
+- TTS playback (max → buddy): the buddy runs an HTTP server (`POST /play`, port 8080) that plays
+  16 kHz 16-bit PCM (WAV or raw, mono→stereo) through the ES8311 speaker, codec-mutex-guarded
+  against recording. It registers its DHCP IP with the server (`POST /register`, exposed via
+  `GET /buddy`). Helper `server/say.sh "text"` pipes Piper (:5050, 22050 Hz) → ffmpeg 16k mono →
+  the buddy's `/play`. Verified working. (Buddy was 10.0.0.31; give it a DHCP reservation for
+  permanence.)
 
 Remaining polish (optional): render Max's `max_reply` on the e-paper (device shows only the user's
 transcript today); `/display` `cost` is null (ccusage not emitting; tokens via JSONL-sum fallback).

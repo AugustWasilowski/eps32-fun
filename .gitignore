@@ -30,3 +30,4 @@ _waveshare_tmp/
 firmware/buddy/tools/recv/
 .vscode/
 .clangd
+firmware/buddy/tools/*.wav

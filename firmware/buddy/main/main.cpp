@@ -23,6 +23,7 @@
 #include "esp_timer.h"
 #include "esp_log.h"
 #include "esp_http_client.h"
+#include "esp_http_server.h"
 #include "cJSON.h"
 #include "lvgl.h"
 
@@ -269,6 +270,16 @@ static inline bool ptt_pressed(void) { return gpio_get_level(BOOT_BUTTON_PIN) ==
 #define BEEP_BUF_BYTES ((SAMPLE_RATE_HZ / 1000) * BEEP_MAX_MS * BYTES_PER_FRAME)
 static uint8_t *s_beep_buf = NULL;  // PSRAM, allocated in app_main
 
+// Serializes codec access so TTS playback (POST /play) never collides with mic
+// recording or beeps. Taken around a PTT cycle and around a /play request.
+static SemaphoreHandle_t s_audio_mux = NULL;
+
+// Inbound TTS (POST /play): whole body buffered in PSRAM, then mono->stereo to codec.
+#define MAX_TTS_BYTES    (1024 * 1024)   // ~32 s of 16 kHz mono 16-bit
+#define TTS_STEREO_FRAMES 2048
+static uint8_t *s_tts_buf = NULL;        // raw uploaded bytes
+static uint8_t *s_tts_stereo = NULL;     // mono->stereo scratch (TTS_STEREO_FRAMES*4)
+
 // Play a sine tone (Hz, ms) to the speaker, with a short fade in/out to avoid
 // clicks. Blocking. Stereo 16-bit at SAMPLE_RATE_HZ (matches the open codec).
 static void play_tone(int freq, int ms, int amp)
@@ -487,11 +498,41 @@ static void http_get_display(void)
     cJSON_Delete(root);
 }
 
+// Tell max where to reach this buddy's /play server (IP is DHCP). Cheap; called
+// each poll cycle so it self-heals across DHCP changes or a server restart.
+static void register_with_max(void)
+{
+    char ip[16];
+    if (!espwifi_get_ip(ip, sizeof(ip))) return;
+    char url[160], body[96];
+    snprintf(url, sizeof(url), "%s/register", BUDDY_SERVER_URL);
+    int blen = snprintf(body, sizeof(body), "{\"ip\":\"%s\",\"port\":8080}", ip);
+
+    esp_http_client_config_t cfg = {};
+    cfg.url = url;
+    cfg.method = HTTP_METHOD_POST;
+    cfg.timeout_ms = 8000;
+    esp_http_client_handle_t client = esp_http_client_init(&cfg);
+    esp_http_client_set_header(client, "Content-Type", "application/json");
+    esp_http_client_set_header(client, "X-Buddy-Token", BUDDY_TOKEN);
+    if (esp_http_client_open(client, blen) == ESP_OK) {
+        esp_http_client_write(client, body, blen);
+        esp_http_client_fetch_headers(client);
+        static bool logged = false;
+        if (!logged) { ESP_LOGI(TAG, "registered with max: %s:8080", ip); logged = true; }
+    }
+    esp_http_client_close(client);
+    esp_http_client_cleanup(client);
+}
+
 // Periodically refresh the display; also refresh immediately when poked.
 static void display_poll_task(void *arg)
 {
     for (;;) {
-        if (espwifi_is_connected()) http_get_display();
+        if (espwifi_is_connected()) {
+            register_with_max();
+            http_get_display();
+        }
         // Wait up to DISPLAY_POLL_SECONDS, or wake early when a transcript pokes us.
         if (xSemaphoreTake(s_display_poke, pdMS_TO_TICKS(DISPLAY_POLL_SECONDS * 1000)) == pdTRUE) {
             // A transcript was just sent — fast-poll so Max's reply shows promptly,
@@ -504,6 +545,112 @@ static void display_poll_task(void *arg)
                 if (strcmp(s_last_max, before) != 0) break;  // Max replied
             }
         }
+    }
+}
+
+// ============================ TTS playback: POST /play ============================
+
+// Find the start of PCM data in a WAV buffer (offset after the "data" subchunk
+// header), scanning the first bytes; falls back to the canonical 44.
+static int wav_data_offset(const uint8_t *b, int n)
+{
+    for (int i = 12; i + 8 <= n && i < 512; i++) {
+        if (memcmp(b + i, "data", 4) == 0) return i + 8;
+    }
+    return 44;
+}
+
+// Play 16-bit PCM through the codec (open at 16 kHz, 2 ch). Mono is duplicated to
+// stereo; stereo is written as-is. Blocking.
+static void play_pcm16(const uint8_t *pcm, size_t bytes, int channels)
+{
+    if (channels >= 2) {
+        audio_playback_write((void *)pcm, (bytes / BYTES_PER_FRAME) * BYTES_PER_FRAME);
+        return;
+    }
+    const int16_t *s = (const int16_t *)pcm;
+    size_t samples = bytes / 2;
+    int16_t *out = (int16_t *)s_tts_stereo;
+    size_t i = 0;
+    while (i < samples) {
+        size_t batch = samples - i;
+        if (batch > TTS_STEREO_FRAMES) batch = TTS_STEREO_FRAMES;
+        for (size_t k = 0; k < batch; k++) {
+            int16_t v = s[i + k];
+            out[2 * k] = v;
+            out[2 * k + 1] = v;
+        }
+        audio_playback_write(out, batch * BYTES_PER_FRAME);
+        i += batch;
+    }
+}
+
+// POST /play — body is 16 kHz 16-bit PCM (WAV or raw, mono or stereo). Gated by
+// X-Buddy-Token. Buffers the body, then plays it through the speaker.
+static esp_err_t play_handler(httpd_req_t *req)
+{
+    char tok[80] = {0};
+    if (httpd_req_get_hdr_value_str(req, "X-Buddy-Token", tok, sizeof(tok)) != ESP_OK ||
+        strcmp(tok, BUDDY_TOKEN) != 0) {
+        httpd_resp_send_err(req, HTTPD_403_FORBIDDEN, "forbidden");
+        return ESP_FAIL;
+    }
+    int len = req->content_len;
+    if (len <= 0 || len > MAX_TTS_BYTES) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "empty or too large");
+        return ESP_FAIL;
+    }
+
+    int got = 0;
+    while (got < len) {
+        int n = httpd_req_recv(req, (char *)s_tts_buf + got, len - got);
+        if (n <= 0) {
+            if (n == HTTPD_SOCK_ERR_TIMEOUT) continue;
+            httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "recv failed");
+            return ESP_FAIL;
+        }
+        got += n;
+    }
+
+    // Parse WAV header if present; else treat as raw 16 kHz mono PCM.
+    int channels = 1, offset = 0;
+    if (got >= 28 && memcmp(s_tts_buf, "RIFF", 4) == 0) {
+        channels = s_tts_buf[22] | (s_tts_buf[23] << 8);
+        int rate = s_tts_buf[24] | (s_tts_buf[25] << 8) |
+                   (s_tts_buf[26] << 16) | (s_tts_buf[27] << 24);
+        offset = wav_data_offset(s_tts_buf, got);
+        if (rate != SAMPLE_RATE_HZ)
+            ESP_LOGW(TAG, "/play: WAV rate %d != %d Hz — will sound off; resample on max",
+                     rate, SAMPLE_RATE_HZ);
+        if (channels < 1) channels = 1;
+    }
+
+    ESP_LOGI(TAG, "/play: %d bytes, %d ch, playing...", got - offset, channels);
+    xSemaphoreTake(s_audio_mux, portMAX_DELAY);
+    play_pcm16(s_tts_buf + offset, got - offset, channels);
+    xSemaphoreGive(s_audio_mux);
+
+    httpd_resp_sendstr(req, "ok");
+    return ESP_OK;
+}
+
+static void start_play_server(void)
+{
+    httpd_config_t config = HTTPD_DEFAULT_CONFIG();
+    config.server_port = 8080;
+    config.stack_size = 8192;
+    config.recv_wait_timeout = 20;
+    config.lru_purge_enable = true;
+    httpd_handle_t server = NULL;
+    if (httpd_start(&server, &config) == ESP_OK) {
+        httpd_uri_t play_uri = {};
+        play_uri.uri = "/play";
+        play_uri.method = HTTP_POST;
+        play_uri.handler = play_handler;
+        httpd_register_uri_handler(server, &play_uri);
+        ESP_LOGI(TAG, "play server up: POST http://<buddy-ip>:8080/play");
+    } else {
+        ESP_LOGE(TAG, "failed to start play server");
     }
 }
 
@@ -531,7 +678,16 @@ extern "C" void app_main(void)
     uint8_t *chunk = (uint8_t *)heap_caps_malloc(CHUNK_BYTES, MALLOC_CAP_SPIRAM);
     uint8_t *wav_buf = (uint8_t *)heap_caps_malloc(WAV_BUF_BYTES, MALLOC_CAP_SPIRAM);
     s_beep_buf = (uint8_t *)heap_caps_malloc(BEEP_BUF_BYTES, MALLOC_CAP_SPIRAM);
-    assert(record_buf && chunk && wav_buf && s_beep_buf && "failed to allocate PSRAM buffers");
+    s_tts_buf = (uint8_t *)heap_caps_malloc(MAX_TTS_BYTES, MALLOC_CAP_SPIRAM);
+    s_tts_stereo = (uint8_t *)heap_caps_malloc(TTS_STEREO_FRAMES * BYTES_PER_FRAME, MALLOC_CAP_SPIRAM);
+    assert(record_buf && chunk && wav_buf && s_beep_buf && s_tts_buf && s_tts_stereo &&
+           "failed to allocate PSRAM buffers");
+
+    s_audio_mux = xSemaphoreCreateMutex();
+    assert(s_audio_mux);
+
+    // HTTP server so max's Piper TTS can push voice messages to the speaker.
+    if (espwifi_is_connected()) start_play_server();
 
     // Start the display poll loop (binary semaphore: poke = immediate refresh).
     s_display_poke = xSemaphoreCreateBinary();
@@ -556,6 +712,8 @@ extern "C" void app_main(void)
             vTaskDelay(pdMS_TO_TICKS(20));
             continue;
         }
+        // Hold the codec for the whole cycle so an incoming /play can't interleave.
+        xSemaphoreTake(s_audio_mux, portMAX_DELAY);
         ESP_LOGI(TAG, "REC start");
         beep_start();
         size_t total = 0;
@@ -576,6 +734,7 @@ extern "C" void app_main(void)
         int status = send_recording(record_buf, total, wav_buf);
         if (status == 200) beep_ok();
         else               beep_fail();
+        xSemaphoreGive(s_audio_mux);
 
         vTaskDelay(pdMS_TO_TICKS(150));  // debounce release edge
     }

@@ -2,6 +2,7 @@
 #define ESP_WIFI_BSP_H
 #include <stdbool.h>
 #include <stdint.h>
+#include <stddef.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -17,6 +18,9 @@ bool espwifi_wait_connected(uint32_t timeout_ms);
 
 // True if currently connected (has an IP lease).
 bool espwifi_is_connected(void);
+
+// Copy the current STA IPv4 (e.g. "10.0.0.31") into out. Returns false if no IP.
+bool espwifi_get_ip(char *out, size_t len);
 
 #ifdef __cplusplus
 }
