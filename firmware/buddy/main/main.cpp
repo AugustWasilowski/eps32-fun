@@ -85,6 +85,7 @@ static char s_last_you[288] = "";
 static char s_last_max[320] = "";        // text currently shown on the "Max:" line
 static char s_last_server_max[320] = ""; // last max_reply seen from /display (so a
                                          // spoken /play text isn't clobbered by a poll)
+static char s_reply[300] = "";           // raw reply text; prefixed per-mode at render
 static int  s_last_ctx_val = -1;         // last bar value rendered
 
 // Buddy mode, cycled by the PWR button (shown on the Context line):
@@ -92,7 +93,7 @@ static int  s_last_ctx_val = -1;         // last bar value rendered
 //   Air = offline — queue to SD, drain later to whichever live mode is active.
 typedef enum { MODE_MAX = 0, MODE_LEO = 1, MODE_AIR = 2 } buddy_mode_t;
 static buddy_mode_t s_mode = MODE_MAX;
-static inline const char *mode_name(void)   { return s_mode == MODE_MAX ? "Max" : s_mode == MODE_LEO ? "Leo" : "AIR"; }
+static inline const char *mode_name(void)   { return s_mode == MODE_MAX ? "Max" : s_mode == MODE_LEO ? "Leo" : "Notes"; }
 // Destination tag sent to the server: max/leo = chat; note = notes.md (Air mode).
 static inline const char *mode_target(void) { return s_mode == MODE_LEO ? "leo" : s_mode == MODE_AIR ? "note" : "max"; }
 
@@ -280,21 +281,33 @@ static void refresh_ctx_line(void)
     if (lvgl_lock(1000)) { refresh_ctx_line_locked(); lvgl_unlock(); }
 }
 
-// Set the "Max:" line to spoken (/play) text. Does NOT touch s_last_server_max,
-// so the next /display poll won't clobber it unless Max's reply actually changes.
-static void display_set_max(const char *txt)
+// Render the bottom reply line from s_reply, prefixed by who you're talking to.
+// In Notes mode there's no reply, so the line is blank. Assumes the LVGL lock.
+static void render_reply_locked(void)
 {
     if (!s_lbl_max) return;
-    char buf[320];
-    snprintf(buf, sizeof(buf), "Max: %s", (txt && txt[0]) ? txt : "(spoke)");
-    if (lvgl_lock(1000)) {
-        if (strcmp(s_last_max, buf) != 0) {
-            lv_label_set_text(s_lbl_max, buf);
-            strncpy(s_last_max, buf, sizeof(s_last_max) - 1);
-            s_last_max[sizeof(s_last_max) - 1] = '\0';
-        }
-        lvgl_unlock();
+    char line[320];
+    if (s_mode == MODE_AIR) line[0] = '\0';  // Notes mode: no reply line
+    else snprintf(line, sizeof(line), "%s: %s", mode_name(), s_reply[0] ? s_reply : "--");
+    if (strcmp(s_last_max, line) != 0) {
+        lv_label_set_text(s_lbl_max, line);
+        strncpy(s_last_max, line, sizeof(s_last_max) - 1);
+        s_last_max[sizeof(s_last_max) - 1] = '\0';
     }
+}
+
+static void render_reply(void)
+{
+    if (lvgl_lock(1000)) { render_reply_locked(); lvgl_unlock(); }
+}
+
+// Set the reply text (from /play spoken text). Does NOT touch s_last_server_max,
+// so the next /display poll won't clobber it unless the server reply changes.
+static void display_set_max(const char *txt)
+{
+    strncpy(s_reply, (txt && txt[0]) ? txt : "", sizeof(s_reply) - 1);
+    s_reply[sizeof(s_reply) - 1] = '\0';
+    render_reply();
 }
 
 // ============================ HTTP: /transcribe + /display ============================
@@ -526,9 +539,8 @@ static void http_get_display(void)
 
     const char *txt = (cJSON_IsString(j_txt) && j_txt->valuestring) ? j_txt->valuestring : "";
     const char *mx = (cJSON_IsString(j_max) && j_max->valuestring) ? j_max->valuestring : "";
-    char you_buf[288], max_buf[320];
+    char you_buf[288];
     snprintf(you_buf, sizeof(you_buf), "You: %s", txt[0] ? txt : "(say something)");
-    snprintf(max_buf, sizeof(max_buf), "Max: %s", mx[0] ? mx : "--");
 
     // Only repaint changed zones — each change is a (slow) e-paper refresh.
     if (lvgl_lock(1000)) {
@@ -536,16 +548,17 @@ static void http_get_display(void)
             lv_label_set_text(s_lbl_tokens, tokens_str);
             strncpy(s_last_tokens, tokens_str, sizeof(s_last_tokens) - 1);
         }
-        refresh_ctx_line_locked();  // composes base % + AIR/queue status, updates bar
+        refresh_ctx_line_locked();  // composes base % + mode/queue status, updates bar
         if (strcmp(s_last_you, you_buf) != 0) {
             lv_label_set_text(s_lbl_you, you_buf);
             strncpy(s_last_you, you_buf, sizeof(s_last_you) - 1);
         }
-        // Only repaint "Max:" when the server's reply genuinely changed — so a
-        // spoken /play text (set via display_set_max) isn't clobbered by polls.
+        // Re-render the reply line only when the server's reply genuinely changed
+        // (so a spoken /play text isn't clobbered by polls). Renderer is mode-aware.
         if (strcmp(s_last_server_max, mx) != 0) {
-            lv_label_set_text(s_lbl_max, max_buf);
-            strncpy(s_last_max, max_buf, sizeof(s_last_max) - 1);
+            strncpy(s_reply, mx, sizeof(s_reply) - 1);
+            s_reply[sizeof(s_reply) - 1] = '\0';
+            render_reply_locked();
             strncpy(s_last_server_max, mx, sizeof(s_last_server_max) - 1);
         }
         lvgl_unlock();
@@ -930,6 +943,7 @@ static void pwr_button_task(void *arg)
             else                         { play_tone(587, 150, 11000); }                           // Air: one low
             xSemaphoreGive(s_audio_mux);
             refresh_ctx_line();
+            render_reply();   // clear the reply line in Notes mode; restore otherwise
         }
     }
 }
