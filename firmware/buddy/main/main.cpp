@@ -367,7 +367,8 @@ static long long now_epoch(void)
     return (t > 1000000000) ? (long long)t : 0;
 }
 
-// --- Battery: ADC1 ch2 (GPIO3), 12-bit, 12dB; actual volts = measured x2 (divider). ---
+// --- Battery: ADC1 ch3 (GPIO4), 12-bit, 12dB; volts = read x2. Divider is gated by
+// GPIO17 (VBAT): must be LOW to read, so we pulse it low during the measurement. ---
 static adc_oneshot_unit_handle_t s_adc = NULL;
 static adc_cali_handle_t s_adc_cali = NULL;
 
@@ -379,10 +380,10 @@ static void battery_adc_init(void)
     adc_oneshot_chan_cfg_t ccfg = {};
     ccfg.atten = ADC_ATTEN_DB_12;
     ccfg.bitwidth = ADC_BITWIDTH_12;
-    adc_oneshot_config_channel(s_adc, ADC_CHANNEL_2, &ccfg);
+    adc_oneshot_config_channel(s_adc, ADC_CHANNEL_3, &ccfg);
     adc_cali_curve_fitting_config_t cal = {};
     cal.unit_id = ADC_UNIT_1;
-    cal.chan = ADC_CHANNEL_2;
+    cal.chan = ADC_CHANNEL_3;
     cal.atten = ADC_ATTEN_DB_12;
     cal.bitwidth = ADC_BITWIDTH_12;
     if (adc_cali_create_scheme_curve_fitting(&cal, &s_adc_cali) != ESP_OK) s_adc_cali = NULL;
@@ -392,16 +393,28 @@ static void battery_adc_init(void)
 static int battery_mv(void)
 {
     if (!s_adc) return -1;
+    // Divider is gated by GPIO17 (VBAT latch): pull low to connect it, sample,
+    // then restore the latch high. Short window so battery power isn't dropped.
+    gpio_set_level((gpio_num_t)VBAT_PWR_PIN, 0);
+    vTaskDelay(pdMS_TO_TICKS(200));
+    // Re-apply the channel after the gate change (mirrors the working scan path).
+    adc_oneshot_chan_cfg_t ccfg = {};
+    ccfg.atten = ADC_ATTEN_DB_12;
+    ccfg.bitwidth = ADC_BITWIDTH_12;
+    adc_oneshot_config_channel(s_adc, ADC_CHANNEL_3, &ccfg);
+    int dummy = 0;
+    adc_oneshot_read(s_adc, ADC_CHANNEL_3, &dummy);  // discard first (settle)
     int acc = 0, n = 0;
     for (int i = 0; i < 8; i++) {
         int raw = 0;
-        if (adc_oneshot_read(s_adc, ADC_CHANNEL_2, &raw) != ESP_OK) continue;
+        if (adc_oneshot_read(s_adc, ADC_CHANNEL_3, &raw) != ESP_OK) continue;
         int mv = 0;
         if (!(s_adc_cali && adc_cali_raw_to_voltage(s_adc_cali, raw, &mv) == ESP_OK))
             mv = raw * 3300 / 4095;
         acc += mv;
         n++;
     }
+    gpio_set_level((gpio_num_t)VBAT_PWR_PIN, 1);  // restore latch
     return n ? (acc / n) * 2 : -1;
 }
 
@@ -604,7 +617,15 @@ static void http_get_display(void)
     char you_buf[288];
     snprintf(you_buf, sizeof(you_buf), "You: %s", txt[0] ? txt : "(say something)");
 
-    int bpct = battery_pct(battery_mv());
+    // Battery read pulses the GPIO17 gate, so throttle to every ~5 min (cache between).
+    static int64_t s_batt_us = 0;
+    static int s_batt_cache = -2;
+    int64_t now_us = esp_timer_get_time();
+    if (s_batt_cache == -2 || now_us - s_batt_us > 300000000LL) {
+        s_batt_cache = battery_pct(battery_mv());
+        s_batt_us = now_us;
+    }
+    int bpct = s_batt_cache;
     char batt_str[12];
     if (bpct >= 0) snprintf(batt_str, sizeof(batt_str), "%d%%", bpct);
     else batt_str[0] = '\0';
@@ -1118,9 +1139,10 @@ extern "C" void app_main(void)
     battery_adc_init();
     {
         int raw = -1;
-        if (s_adc) adc_oneshot_read(s_adc, ADC_CHANNEL_2, &raw);
+        if (s_adc) adc_oneshot_read(s_adc, ADC_CHANNEL_3, &raw);
         int mv = battery_mv();
-        ESP_LOGI(TAG, "battery: raw=%d, %d mV (~%d%%)", raw, mv, battery_pct(mv));
+        ESP_LOGI(TAG, "battery: %d mV (~%d%%)", mv, battery_pct(mv));
+        (void)raw;
     }
 
     // Mount the TF/SD card (for offline capture queue) and self-test it.
