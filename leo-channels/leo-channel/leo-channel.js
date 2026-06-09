@@ -8,7 +8,10 @@
  * leo_chat_reply tool, which POSTs back to the buddy server's /chat_reply so the
  * reply shows on the e-paper. Node port of max's bun-based ss-chat-channel.
  *
- * Listens on 0.0.0.0:8804 (gated by X-Webhook-Token). Reachable from max on the LAN.
+ * The HTTP listener (port 8804) only starts when LEO_CHANNEL_ACTIVE=1 (set by the
+ * dedicated Leo launcher). That way the plugin can stay globally enabled — every
+ * other `claude` session loads the MCP server quietly without binding the port
+ * (no conflict / no "MCP setup issue"); only the Leo session serves the channel.
  */
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
@@ -119,28 +122,35 @@ function clip(s, max) {
   return t.length > max ? t.slice(0, max - 1) + '…' : t;
 }
 
-http.createServer((req, res) => {
-  if (req.method !== 'POST') { res.writeHead(405); res.end('method not allowed'); return; }
-  const presented = (req.headers['x-webhook-token'] || '').toString().trim();
-  if (!presented || presented !== token) { res.writeHead(403); res.end('forbidden'); return; }
-  let body = '';
-  req.on('data', (c) => { body += c; });
-  req.on('end', async () => {
-    let j;
-    try { j = JSON.parse(body); } catch { res.writeHead(400); res.end('bad json'); return; }
-    const requestId = j.request_id ?? j.requestId;
-    const text = clip(j.text ?? j.transcript, 4000).trim();
-    if (!requestId || !text) { res.writeHead(400); res.end('missing request_id or text'); return; }
-    if (j.reply_url) PENDING.set(String(requestId), { url: String(j.reply_url), exp: Date.now() + TTL_MS });
-    try {
-      await mcp.notification({
-        method: 'notifications/claude/channel',
-        params: { content: text, meta: { request_id: String(requestId), source: 'leo', host: 'leo' } },
-      });
-    } catch (err) {
-      process.stderr.write(`[leo-channel] notify error: ${err.message}\n`);
-    }
-    res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ ok: true, request_id: String(requestId) }));
+// Every session that loads the plugin tries to bind; only one wins (the always-on
+// Leo, started first at logon). Others fail gracefully on EADDRINUSE without
+// crashing the MCP server (so no "setup issue" and no port fight).
+{
+  const server = http.createServer((req, res) => {
+    if (req.method !== 'POST') { res.writeHead(405); res.end('method not allowed'); return; }
+    const presented = (req.headers['x-webhook-token'] || '').toString().trim();
+    if (!presented || presented !== token) { res.writeHead(403); res.end('forbidden'); return; }
+    let body = '';
+    req.on('data', (c) => { body += c; });
+    req.on('end', async () => {
+      let j;
+      try { j = JSON.parse(body); } catch { res.writeHead(400); res.end('bad json'); return; }
+      const requestId = j.request_id ?? j.requestId;
+      const text = clip(j.text ?? j.transcript, 4000).trim();
+      if (!requestId || !text) { res.writeHead(400); res.end('missing request_id or text'); return; }
+      if (j.reply_url) PENDING.set(String(requestId), { url: String(j.reply_url), exp: Date.now() + TTL_MS });
+      try {
+        await mcp.notification({
+          method: 'notifications/claude/channel',
+          params: { content: text, meta: { request_id: String(requestId), source: 'leo', host: 'leo' } },
+        });
+      } catch (err) {
+        process.stderr.write(`[leo-channel] notify error: ${err.message}\n`);
+      }
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: true, request_id: String(requestId) }));
+    });
   });
-}).listen(PORT, '0.0.0.0', () => process.stderr.write(`[leo-channel] listening on http://0.0.0.0:${PORT}\n`));
+  server.on('error', (e) => process.stderr.write(`[leo-channel] http listen skipped: ${e.code || e.message} (another session holds ${PORT})\n`));
+  server.listen(PORT, '0.0.0.0', () => process.stderr.write(`[leo-channel] listening on http://0.0.0.0:${PORT}\n`));
+}

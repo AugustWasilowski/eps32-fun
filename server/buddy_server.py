@@ -21,9 +21,13 @@ proven two-way path (Max replies via ss_chat_reply), so we route through it.
 Run (dev):   uvicorn buddy_server:app --host 0.0.0.0 --port 8810
 Run (prod):  see docker-compose.yml
 """
+import asyncio
+import audioop
+import io
 import os
 import tempfile
 import uuid
+import wave
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
@@ -57,6 +61,43 @@ LEO_REPLY_URL = os.environ.get("LEO_REPLY_URL", "")
 NOTES_DIR = os.environ.get("NOTES_DIR", "/inbox")
 NOTES_FILE = os.path.join(NOTES_DIR, "notes.md")
 NOTES_TZ = os.environ.get("NOTES_TZ", "America/Chicago")
+
+# Piper TTS service (on the host) used to speak replies back through the buddy.
+PIPER_URL = os.environ.get("PIPER_URL", "http://host.docker.internal:5050")
+SPEAK_REPLIES = os.environ.get("SPEAK_REPLIES", "1") == "1"
+
+
+async def speak_on_buddy(text: str) -> None:
+    """Synthesize `text` with Piper and play it through the buddy's speaker.
+    Piper outputs 22050 Hz mono WAV; we resample to the buddy's 16 kHz (stdlib
+    audioop) and POST raw PCM to /play (which also shows the text on the e-paper)."""
+    ip = STATE.get("buddy_ip")
+    if not text or not ip:
+        return
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            r = await client.post(PIPER_URL, json={"text": text[:1000]})
+            r.raise_for_status()
+            wav_bytes = r.content
+        with wave.open(io.BytesIO(wav_bytes), "rb") as w:
+            rate, ch = w.getframerate(), w.getnchannels()
+            frames = w.readframes(w.getnframes())
+        if ch == 2:
+            frames = audioop.tomono(frames, 2, 0.5, 0.5)
+        pcm16k, _ = audioop.ratecv(frames, 2, 1, rate, 16000, None)
+        hdr_text = text.replace("\n", " ").replace("\r", " ")[:200].encode("ascii", "ignore").decode()
+        async with httpx.AsyncClient(timeout=30) as client:
+            await client.post(
+                f"http://{ip}:{STATE.get('buddy_port', 8080)}/play",
+                content=pcm16k,
+                headers={
+                    "X-Buddy-Token": BUDDY_TOKEN,
+                    "X-Buddy-Text": hdr_text,
+                    "Content-Type": "application/octet-stream",
+                },
+            )
+    except Exception as exc:  # noqa: BLE001 — speaking is best-effort
+        print(f"[buddy] speak_on_buddy failed: {exc}")
 
 
 def append_note(text: str, epoch: int) -> None:
@@ -155,7 +196,12 @@ async def chat_reply(request: Request, x_webhook_token: str | None = Header(defa
     if not x_webhook_token or x_webhook_token not in valid:
         raise HTTPException(status_code=403, detail="forbidden")
     body = await request.json()
-    STATE["max_reply"] = (body or {}).get("text", "") or ""
+    text = (body or {}).get("text", "") or ""
+    STATE["max_reply"] = text
+    # Speak the reply back through the buddy (Piper -> /play). Both Max & Leo
+    # replies flow through here, so neither needs a TTS skill of its own.
+    if SPEAK_REPLIES and text:
+        asyncio.create_task(speak_on_buddy(text))
     return JSONResponse({"ok": True})
 
 
