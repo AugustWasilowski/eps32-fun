@@ -17,6 +17,7 @@
 #include <string.h>
 #include <dirent.h>
 #include <sys/stat.h>
+#include <time.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/semphr.h"
@@ -29,6 +30,7 @@
 #include "esp_vfs_fat.h"
 #include "sdmmc_cmd.h"
 #include "driver/sdmmc_host.h"
+#include "esp_netif_sntp.h"
 #include "cJSON.h"
 #include "lvgl.h"
 
@@ -91,8 +93,8 @@ static int  s_last_ctx_val = -1;         // last bar value rendered
 typedef enum { MODE_MAX = 0, MODE_LEO = 1, MODE_AIR = 2 } buddy_mode_t;
 static buddy_mode_t s_mode = MODE_MAX;
 static inline const char *mode_name(void)   { return s_mode == MODE_MAX ? "Max" : s_mode == MODE_LEO ? "Leo" : "AIR"; }
-static inline const char *mode_target(void) { return s_mode == MODE_LEO ? "leo" : "max"; }
-static inline bool mode_is_live(void)       { return s_mode != MODE_AIR; }
+// Destination tag sent to the server: max/leo = chat; note = notes.md (Air mode).
+static inline const char *mode_target(void) { return s_mode == MODE_LEO ? "leo" : s_mode == MODE_AIR ? "note" : "max"; }
 
 static int  s_queue_count = 0;
 static char s_ctx_base[24] = "Context: --";  // "Context: NN%" from the last poll
@@ -331,6 +333,13 @@ static double rms_int16(const uint8_t *buf, size_t len)
 
 static inline bool ptt_pressed(void) { return gpio_get_level(BOOT_BUTTON_PIN) == 0; }
 
+// Current UNIX epoch (seconds), or 0 if the clock isn't SNTP-synced yet.
+static long long now_epoch(void)
+{
+    time_t t = time(NULL);
+    return (t > 1000000000) ? (long long)t : 0;
+}
+
 // --- Audible feedback (ES8311 speaker; codec already open for playback). ---
 #define BEEP_MAX_MS    200
 #define BEEP_BUF_BYTES ((SAMPLE_RATE_HZ / 1000) * BEEP_MAX_MS * BYTES_PER_FRAME)
@@ -375,7 +384,8 @@ static void beep_queued(void) { play_tone(784, 80, 11000); play_tone(587, 110, 1
 
 // POST a WAV to /transcribe. On HTTP 200, copies the transcript into out (size
 // out_sz) and returns the status code; returns negative on transport error.
-static int post_wav(const uint8_t *wav, size_t wav_len, char *out, size_t out_sz)
+static int post_wav(const uint8_t *wav, size_t wav_len, const char *target, long long epoch,
+                    char *out, size_t out_sz)
 {
     char url[160];
     snprintf(url, sizeof(url), "%s/transcribe", BUDDY_SERVER_URL);
@@ -387,9 +397,14 @@ static int post_wav(const uint8_t *wav, size_t wav_len, char *out, size_t out_sz
     esp_http_client_handle_t client = esp_http_client_init(&cfg);
     esp_http_client_set_header(client, "Content-Type", "audio/wav");
     esp_http_client_set_header(client, "X-Buddy-Token", BUDDY_TOKEN);
-    esp_http_client_set_header(client, "X-Buddy-Target", mode_target());
+    esp_http_client_set_header(client, "X-Buddy-Target", target);
+    if (epoch > 0) {
+        char ts[24];
+        snprintf(ts, sizeof(ts), "%lld", epoch);
+        esp_http_client_set_header(client, "X-Buddy-Time", ts);
+    }
 
-    ESP_LOGI(TAG, "POST %s  (%u bytes, target=%s)", url, (unsigned)wav_len, mode_target());
+    ESP_LOGI(TAG, "POST %s  (%u bytes, target=%s)", url, (unsigned)wav_len, target);
     esp_err_t err = esp_http_client_open(client, wav_len);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "http open failed: %s", esp_err_to_name(err));
@@ -422,10 +437,10 @@ static int post_wav(const uint8_t *wav, size_t wav_len, char *out, size_t out_sz
 
 // POST a complete WAV buffer (header + PCM) to /transcribe; on 200 show the
 // transcript and poke the poll task. Returns HTTP status (negative on error).
-static int post_and_show(uint8_t *wav, size_t wav_len)
+static int post_and_show(uint8_t *wav, size_t wav_len, const char *target, long long epoch)
 {
     char transcript[256];
-    int status = post_wav(wav, wav_len, transcript, sizeof(transcript));
+    int status = post_wav(wav, wav_len, target, epoch, transcript, sizeof(transcript));
     if (status == 200) {
         display_set_transcript(transcript);
         if (s_display_poke) xSemaphoreGive(s_display_poke);
@@ -762,7 +777,7 @@ static void queue_scan_init(void)
         struct dirent *e;
         while ((e = readdir(d)) != NULL) {
             unsigned n;
-            if (sscanf(e->d_name, "%u.wav", &n) == 1) {
+            if (sscanf(e->d_name, "%u_", &n) == 1) {
                 count++;
                 if (n + 1 > next) next = n + 1;
             }
@@ -774,14 +789,15 @@ static void queue_scan_init(void)
     ESP_LOGI(TAG, "queue: %d pending, next seq %u", count, (unsigned)next);
 }
 
-// Save a complete WAV (header + PCM) to the SD queue for later upload.
-static bool save_to_queue(const uint8_t *wav, size_t len)
+// Save a complete WAV (header + PCM) to the SD queue for later upload. The
+// filename encodes the destination + record epoch: NNNNNN_<target>_<epoch>.wav.
+static bool save_to_queue(const uint8_t *wav, size_t len, const char *target, long long epoch)
 {
     if (!s_sd_ok) return false;
-    char path[64];
+    char path[80];
     bool ok = false;
     xSemaphoreTake(s_sd_mux, portMAX_DELAY);
-    snprintf(path, sizeof(path), QUEUE_DIR "/%06u.wav", (unsigned)s_next_seq);
+    snprintf(path, sizeof(path), QUEUE_DIR "/%06u_%s_%lld.wav", (unsigned)s_next_seq, target, epoch);
     FILE *fp = fopen(path, "wb");
     if (fp) {
         ok = (fwrite(wav, 1, len, fp) == len);
@@ -800,7 +816,7 @@ static bool save_to_queue(const uint8_t *wav, size_t len)
 
 // Stream a queued WAV file to /transcribe (no big buffer). On 200, show the
 // transcript + poke. Returns HTTP status (negative on error).
-static int post_file_and_show(const char *path)
+static int post_file_and_show(const char *path, const char *target, long long epoch)
 {
     struct stat st;
     if (stat(path, &st) != 0 || st.st_size <= 0) return -1;
@@ -816,7 +832,12 @@ static int post_file_and_show(const char *path)
     esp_http_client_handle_t client = esp_http_client_init(&cfg);
     esp_http_client_set_header(client, "Content-Type", "audio/wav");
     esp_http_client_set_header(client, "X-Buddy-Token", BUDDY_TOKEN);
-    esp_http_client_set_header(client, "X-Buddy-Target", mode_target());
+    esp_http_client_set_header(client, "X-Buddy-Target", target);
+    if (epoch > 0) {
+        char ts[24];
+        snprintf(ts, sizeof(ts), "%lld", epoch);
+        esp_http_client_set_header(client, "X-Buddy-Time", ts);
+    }
 
     if (esp_http_client_open(client, st.st_size) != ESP_OK) {
         fclose(fp); esp_http_client_cleanup(client); return -1;
@@ -856,24 +877,31 @@ static int post_file_and_show(const char *path)
 static void drain_task(void *arg)
 {
     for (;;) {
-        if (s_sd_ok && s_queue_count > 0 && mode_is_live() && espwifi_is_connected()) {
+        if (s_sd_ok && s_queue_count > 0 && espwifi_is_connected()) {
+            // Pick the oldest queued file (lowest seq), reading its target + epoch.
             unsigned oldest_n = 0xffffffffu;
+            char target[16] = "max";
+            long long epoch = 0;
             xSemaphoreTake(s_sd_mux, portMAX_DELAY);
             DIR *d = opendir(QUEUE_DIR);
             if (d) {
                 struct dirent *e;
                 while ((e = readdir(d)) != NULL) {
-                    unsigned n;
-                    if (sscanf(e->d_name, "%u.wav", &n) == 1 && n < oldest_n) oldest_n = n;
+                    unsigned n; char tgt[16]; long long ep;
+                    if (sscanf(e->d_name, "%u_%15[^_]_%lld.wav", &n, tgt, &ep) == 3 && n < oldest_n) {
+                        oldest_n = n;
+                        snprintf(target, sizeof(target), "%s", tgt);
+                        epoch = ep;
+                    }
                 }
                 closedir(d);
             }
             xSemaphoreGive(s_sd_mux);
 
             if (oldest_n != 0xffffffffu) {
-                char path[64];
-                snprintf(path, sizeof(path), QUEUE_DIR "/%06u.wav", oldest_n);
-                if (post_file_and_show(path) == 200) {
+                char path[96];
+                snprintf(path, sizeof(path), QUEUE_DIR "/%06u_%s_%lld.wav", oldest_n, target, epoch);
+                if (post_file_and_show(path, target, epoch) == 200) {
                     xSemaphoreTake(s_sd_mux, portMAX_DELAY);
                     remove(path);
                     if (s_queue_count > 0) s_queue_count--;
@@ -926,6 +954,10 @@ extern "C" void app_main(void)
     espwifi_Init(WIFI_SSID, WIFI_PASSWORD);
     if (espwifi_wait_connected(20000)) {
         ESP_LOGI(TAG, "WiFi connected. Server: %s", BUDDY_SERVER_URL);
+        // Sync the clock so voice notes get the real record time (even if queued
+        // offline and drained later). Best-effort; persists while powered.
+        esp_sntp_config_t sntp_cfg = ESP_NETIF_SNTP_DEFAULT_CONFIG("pool.ntp.org");
+        esp_netif_sntp_init(&sntp_cfg);
     } else {
         ESP_LOGW(TAG, "WiFi NOT connected within 20s — will keep retrying in background.");
     }
@@ -1001,14 +1033,16 @@ extern "C" void app_main(void)
         } else {
             write_wav_header(rec, mono_bytes, SAMPLE_RATE_HZ, 1, 16);
             size_t wav_len = WAV_HDR_BYTES + mono_bytes;
+            const char *target = mode_target();   // max | leo | note
+            long long epoch = now_epoch();
             bool sent = false;
-            if (mode_is_live() && espwifi_is_connected()) {
-                sent = (post_and_show(rec, wav_len) == 200);  // live: send to Max/Leo now
+            if (espwifi_is_connected()) {
+                sent = (post_and_show(rec, wav_len, target, epoch) == 200);  // deliver now
             }
             if (sent) {
                 beep_ok();
-            } else if (s_sd_ok && save_to_queue(rec, wav_len)) {
-                beep_queued();   // offline/air/failed → saved on SD for later
+            } else if (s_sd_ok && save_to_queue(rec, wav_len, target, epoch)) {
+                beep_queued();   // offline/failed → saved on SD, drains to `target` later
             } else {
                 beep_fail();
             }

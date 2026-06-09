@@ -11,6 +11,8 @@ services:
       - buddy-models:/models
       # read-only access to Claude data for token usage + context %
       - ${HOME}/.claude:/root/.claude:ro
+      # shared inbox for voice notes (Air mode) — Leo + Max both read this
+      - /mnt/storage/shares/_claude_inbox:/inbox
     environment:
       CLAUDE_DIR: /root/.claude
     extra_hosts:

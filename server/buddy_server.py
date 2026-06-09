@@ -24,6 +24,8 @@ Run (prod):  see docker-compose.yml
 import os
 import tempfile
 import uuid
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
 import httpx
 from fastapi import FastAPI, Header, HTTPException, Request
@@ -49,6 +51,32 @@ SELF_REPLY_URL = os.environ.get("SELF_REPLY_URL", "http://localhost:8810/chat_re
 LEO_CHANNEL_URL = os.environ.get("LEO_CHANNEL_URL", "")
 LEO_CHANNEL_TOKEN = os.environ.get("LEO_CHANNEL_TOKEN", "")
 LEO_REPLY_URL = os.environ.get("LEO_REPLY_URL", "")
+
+# Air mode = voice notes. Appended as a timestamped running log to this file,
+# in the shared inbox both Leo and Max can read.
+NOTES_DIR = os.environ.get("NOTES_DIR", "/inbox")
+NOTES_FILE = os.path.join(NOTES_DIR, "notes.md")
+NOTES_TZ = os.environ.get("NOTES_TZ", "America/Chicago")
+
+
+def append_note(text: str, epoch: int) -> None:
+    """Append a timestamped voice note to the shared notes.md running log."""
+    if not text:
+        return
+    try:
+        tz = ZoneInfo(NOTES_TZ)
+    except Exception:  # noqa: BLE001
+        tz = ZoneInfo("UTC")
+    # Use the device's record time when provided (sane epoch), else now.
+    when = datetime.fromtimestamp(epoch, tz) if epoch > 1_000_000_000 else datetime.now(tz)
+    stamp = when.strftime("%Y-%m-%d %H:%M:%S %Z")
+    try:
+        os.makedirs(NOTES_DIR, exist_ok=True)
+        with open(NOTES_FILE, "a", encoding="utf-8") as f:
+            f.write(f"- **{stamp}** — {text}\n")
+        print(f"[buddy] note appended ({stamp}): {text}")
+    except Exception as exc:  # noqa: BLE001
+        print(f"[buddy] note append failed: {exc}")
 
 
 async def _deliver(text: str, target: str) -> None:
@@ -87,6 +115,7 @@ async def transcribe(
     request: Request,
     x_buddy_token: str | None = Header(default=None),
     x_buddy_target: str | None = Header(default=None),
+    x_buddy_time: str | None = Header(default=None),
 ):
     _auth(x_buddy_token)
 
@@ -104,10 +133,17 @@ async def transcribe(
 
     STATE["last_transcript"] = text
 
-    # Route into the chosen assistant's channel (default: Max). The reply routes
-    # back to /chat_reply via the channel's reply_url.
+    # Route by target: note -> notes.md running log; otherwise into the chosen
+    # assistant's channel (max | leo). x_buddy_time = device record epoch (notes).
     target = (x_buddy_target or "max").lower()
-    await _deliver(text, target)
+    if target == "note":
+        try:
+            epoch = int(x_buddy_time) if x_buddy_time else 0
+        except ValueError:
+            epoch = 0
+        append_note(text, epoch)
+    else:
+        await _deliver(text, target)
 
     return PlainTextResponse(text)
 
