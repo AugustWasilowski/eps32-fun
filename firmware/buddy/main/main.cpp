@@ -367,7 +367,7 @@ static long long now_epoch(void)
     return (t > 1000000000) ? (long long)t : 0;
 }
 
-// --- Battery: ADC1 ch3 (GPIO4), 12-bit, 12dB; actual volts = measured x2 (divider). ---
+// --- Battery: ADC1 ch2 (GPIO3), 12-bit, 12dB; actual volts = measured x2 (divider). ---
 static adc_oneshot_unit_handle_t s_adc = NULL;
 static adc_cali_handle_t s_adc_cali = NULL;
 
@@ -379,10 +379,10 @@ static void battery_adc_init(void)
     adc_oneshot_chan_cfg_t ccfg = {};
     ccfg.atten = ADC_ATTEN_DB_12;
     ccfg.bitwidth = ADC_BITWIDTH_12;
-    adc_oneshot_config_channel(s_adc, ADC_CHANNEL_3, &ccfg);
+    adc_oneshot_config_channel(s_adc, ADC_CHANNEL_2, &ccfg);
     adc_cali_curve_fitting_config_t cal = {};
     cal.unit_id = ADC_UNIT_1;
-    cal.chan = ADC_CHANNEL_3;
+    cal.chan = ADC_CHANNEL_2;
     cal.atten = ADC_ATTEN_DB_12;
     cal.bitwidth = ADC_BITWIDTH_12;
     if (adc_cali_create_scheme_curve_fitting(&cal, &s_adc_cali) != ESP_OK) s_adc_cali = NULL;
@@ -395,7 +395,7 @@ static int battery_mv(void)
     int acc = 0, n = 0;
     for (int i = 0; i < 8; i++) {
         int raw = 0;
-        if (adc_oneshot_read(s_adc, ADC_CHANNEL_3, &raw) != ESP_OK) continue;
+        if (adc_oneshot_read(s_adc, ADC_CHANNEL_2, &raw) != ESP_OK) continue;
         int mv = 0;
         if (!(s_adc_cali && adc_cali_raw_to_voltage(s_adc_cali, raw, &mv) == ESP_OK))
             mv = raw * 3300 / 4095;
@@ -1118,7 +1118,7 @@ extern "C" void app_main(void)
     battery_adc_init();
     {
         int raw = -1;
-        if (s_adc) adc_oneshot_read(s_adc, ADC_CHANNEL_3, &raw);
+        if (s_adc) adc_oneshot_read(s_adc, ADC_CHANNEL_2, &raw);
         int mv = battery_mv();
         ESP_LOGI(TAG, "battery: raw=%d, %d mV (~%d%%)", raw, mv, battery_pct(mv));
     }
