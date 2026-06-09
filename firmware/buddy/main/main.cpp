@@ -304,6 +304,7 @@ static void beep_start(void) { play_tone(1047, 70, 12000); }                    
 static void beep_stop(void)  { play_tone(660, 70, 12000); }                        // low: stopped
 static void beep_ok(void)    { play_tone(1047, 60, 12000); play_tone(1568, 90, 12000); } // rising: sent
 static void beep_fail(void)  { play_tone(330, 220, 12000); }                       // low long: failed
+static void beep_incoming(void) { play_tone(988, 70, 11000); play_tone(1319, 120, 11000); } // rising: incoming TTS
 
 // POST a WAV to /transcribe. On HTTP 200, copies the transcript into out (size
 // out_sz) and returns the status code; returns negative on transport error.
@@ -627,6 +628,8 @@ static esp_err_t play_handler(httpd_req_t *req)
 
     ESP_LOGI(TAG, "/play: %d bytes, %d ch, playing...", got - offset, channels);
     xSemaphoreTake(s_audio_mux, portMAX_DELAY);
+    beep_incoming();                      // heads-up chime before the message
+    vTaskDelay(pdMS_TO_TICKS(120));       // small gap so it doesn't run into speech
     play_pcm16(s_tts_buf + offset, got - offset, channels);
     xSemaphoreGive(s_audio_mux);
 
