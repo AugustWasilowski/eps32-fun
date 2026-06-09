@@ -22,10 +22,14 @@ if [ -z "$PLAY_URL" ] || [ "$PLAY_URL" = "null" ]; then
   exit 1
 fi
 
+# Header values must be single-line; collapse any newlines for the display text.
+HDR_TEXT="$(printf '%s' "$TEXT" | tr '\n\r' '  ')"
+
 payload="$(jq -nc --arg t "$TEXT" '{text:$t}')"
 curl -sf -X POST -H "Content-Type: application/json" --data "$payload" "$PIPER_URL" \
   | ffmpeg -loglevel error -i - -ar 16000 -ac 1 -f s16le - \
   | curl -sf --data-binary @- \
       -H "X-Buddy-Token: $TOKEN" -H "Content-Type: application/octet-stream" \
+      -H "X-Buddy-Text: $HDR_TEXT" \
       "$PLAY_URL" >/dev/null
 echo "spoke on buddy ($PLAY_URL): $TEXT"

@@ -72,7 +72,9 @@ static lv_obj_t *s_lbl_max = NULL;   // Max's reply (wrapped, main content)
 static char s_last_tokens[64] = "";
 static char s_last_ctx[32] = "";
 static char s_last_you[288] = "";
-static char s_last_max[320] = "";
+static char s_last_max[320] = "";        // text currently shown on the "Max:" line
+static char s_last_server_max[320] = ""; // last max_reply seen from /display (so a
+                                         // spoken /play text isn't clobbered by a poll)
 
 // Flush LVGL's render buffer to the e-paper (full-screen partial refresh).
 // Identical pixel path to Waveshare's audio-test demo.
@@ -224,6 +226,23 @@ static void display_set_transcript(const char *txt)
             lv_label_set_text(s_lbl_you, buf);
             strncpy(s_last_you, buf, sizeof(s_last_you) - 1);
             s_last_you[sizeof(s_last_you) - 1] = '\0';
+        }
+        lvgl_unlock();
+    }
+}
+
+// Set the "Max:" line to spoken (/play) text. Does NOT touch s_last_server_max,
+// so the next /display poll won't clobber it unless Max's reply actually changes.
+static void display_set_max(const char *txt)
+{
+    if (!s_lbl_max) return;
+    char buf[320];
+    snprintf(buf, sizeof(buf), "Max: %s", (txt && txt[0]) ? txt : "(spoke)");
+    if (lvgl_lock(1000)) {
+        if (strcmp(s_last_max, buf) != 0) {
+            lv_label_set_text(s_lbl_max, buf);
+            strncpy(s_last_max, buf, sizeof(s_last_max) - 1);
+            s_last_max[sizeof(s_last_max) - 1] = '\0';
         }
         lvgl_unlock();
     }
@@ -490,9 +509,12 @@ static void http_get_display(void)
             lv_label_set_text(s_lbl_you, you_buf);
             strncpy(s_last_you, you_buf, sizeof(s_last_you) - 1);
         }
-        if (strcmp(s_last_max, max_buf) != 0) {
+        // Only repaint "Max:" when the server's reply genuinely changed — so a
+        // spoken /play text (set via display_set_max) isn't clobbered by polls.
+        if (strcmp(s_last_server_max, mx) != 0) {
             lv_label_set_text(s_lbl_max, max_buf);
             strncpy(s_last_max, max_buf, sizeof(s_last_max) - 1);
+            strncpy(s_last_server_max, mx, sizeof(s_last_server_max) - 1);
         }
         lvgl_unlock();
     }
@@ -624,6 +646,13 @@ static esp_err_t play_handler(httpd_req_t *req)
             ESP_LOGW(TAG, "/play: WAV rate %d != %d Hz — will sound off; resample on max",
                      rate, SAMPLE_RATE_HZ);
         if (channels < 1) channels = 1;
+    }
+
+    // Optional: caller can pass the spoken text to show on the e-paper.
+    char say_text[256];
+    if (httpd_req_get_hdr_value_str(req, "X-Buddy-Text", say_text, sizeof(say_text)) == ESP_OK
+        && say_text[0]) {
+        display_set_max(say_text);
     }
 
     ESP_LOGI(TAG, "/play: %d bytes, %d ch, playing...", got - offset, channels);
