@@ -24,6 +24,9 @@
 #include "esp_log.h"
 #include "esp_http_client.h"
 #include "esp_http_server.h"
+#include "esp_vfs_fat.h"
+#include "sdmmc_cmd.h"
+#include "driver/sdmmc_host.h"
 #include "cJSON.h"
 #include "lvgl.h"
 
@@ -666,6 +669,51 @@ static void start_play_server(void)
     }
 }
 
+// ============================ SD card (TF slot) ============================
+// 1-bit SDMMC on this board: CLK=39, CMD=41, D0=40 (Waveshare 04_SD_Card example).
+#define SD_CLK_PIN  GPIO_NUM_39
+#define SD_CMD_PIN  GPIO_NUM_41
+#define SD_D0_PIN   GPIO_NUM_40
+#define SD_MOUNT    "/sdcard"
+static bool s_sd_ok = false;
+
+static bool sdcard_mount(void)
+{
+    sdmmc_host_t host = SDMMC_HOST_DEFAULT();
+    sdmmc_slot_config_t slot = SDMMC_SLOT_CONFIG_DEFAULT();
+    slot.width = 1;
+    slot.clk = SD_CLK_PIN;
+    slot.cmd = SD_CMD_PIN;
+    slot.d0 = SD_D0_PIN;
+
+    esp_vfs_fat_sdmmc_mount_config_t mcfg = {};
+    mcfg.format_if_mount_failed = false;   // never reformat the user's card
+    mcfg.max_files = 5;
+    mcfg.allocation_unit_size = 16 * 1024;
+
+    sdmmc_card_t *card = NULL;
+    esp_err_t ret = esp_vfs_fat_sdmmc_mount(SD_MOUNT, &host, &slot, &mcfg, &card);
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "SD mount failed: %s (card inserted & FAT32?)", esp_err_to_name(ret));
+        return false;
+    }
+    uint64_t mb = ((uint64_t)card->csd.capacity * card->csd.sector_size) / (1024 * 1024);
+    ESP_LOGI(TAG, "SD mounted at %s: %lluMB", SD_MOUNT, (unsigned long long)mb);
+    return true;
+}
+
+static void sdcard_selftest(void)
+{
+    FILE *f = fopen(SD_MOUNT "/buddy_test.txt", "w");
+    if (!f) { ESP_LOGW(TAG, "SD test: open-for-write failed"); return; }
+    fprintf(f, "buddy sd ok\n");
+    fclose(f);
+    char line[32] = {0};
+    f = fopen(SD_MOUNT "/buddy_test.txt", "r");
+    if (f) { if (!fgets(line, sizeof(line), f)) line[0] = '\0'; fclose(f); }
+    ESP_LOGI(TAG, "SD test: wrote+read back \"%s\"", line);
+}
+
 // ============================ app_main ============================
 
 extern "C" void app_main(void)
@@ -677,6 +725,10 @@ extern "C" void app_main(void)
 
     // LVGL display on top of the (already-initialized) e-paper driver.
     display_init();
+
+    // Mount the TF/SD card (for offline capture queue) and self-test it.
+    s_sd_ok = sdcard_mount();
+    if (s_sd_ok) sdcard_selftest();
 
     // WiFi (creds from secrets.h).
     espwifi_Init(WIFI_SSID, WIFI_PASSWORD);
