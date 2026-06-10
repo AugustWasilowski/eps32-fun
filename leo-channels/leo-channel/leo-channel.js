@@ -8,10 +8,11 @@
  * leo_chat_reply tool, which POSTs back to the buddy server's /chat_reply so the
  * reply shows on the e-paper. Node port of max's bun-based ss-chat-channel.
  *
- * The HTTP listener (port 8804) only starts when LEO_CHANNEL_ACTIVE=1 (set by the
- * dedicated Leo launcher). That way the plugin can stay globally enabled — every
- * other `claude` session loads the MCP server quietly without binding the port
- * (no conflict / no "MCP setup issue"); only the Leo session serves the channel.
+ * Port ownership uses take-over on conflict: the most recently launched Leo wins.
+ * On startup each instance tries to bind port 8804; if another leo-channel already
+ * holds it, the newcomer sends a token-authenticated takeover request asking the
+ * holder to release the port, then retries — so the freshly launched `leo` always
+ * becomes the active receiver and older sessions go quietly deaf.
  */
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
@@ -122,35 +123,70 @@ function clip(s, max) {
   return t.length > max ? t.slice(0, max - 1) + '…' : t;
 }
 
-// Every session that loads the plugin tries to bind; only one wins (the always-on
-// Leo, started first at logon). Others fail gracefully on EADDRINUSE without
-// crashing the MCP server (so no "setup issue" and no port fight).
-{
-  const server = http.createServer((req, res) => {
-    if (req.method !== 'POST') { res.writeHead(405); res.end('method not allowed'); return; }
+// Port ownership with take-over on conflict: the MOST RECENTLY launched Leo wins.
+// On startup we try to bind PORT; if another leo-channel already holds it, we POST a
+// token-authenticated takeover request asking it to relinquish, then retry — so every
+// fresh `leo` becomes the active receiver and older ones go quietly deaf.
+const TAKEOVER_PATH = '/_leo_yield';
+let activeServer = null;
+
+function handleRequest(req, res) {
+  // A newer leo-channel instance is asking us to release the port — yield it.
+  if (req.method === 'POST' && req.url === TAKEOVER_PATH) {
     const presented = (req.headers['x-webhook-token'] || '').toString().trim();
     if (!presented || presented !== token) { res.writeHead(403); res.end('forbidden'); return; }
-    let body = '';
-    req.on('data', (c) => { body += c; });
-    req.on('end', async () => {
-      let j;
-      try { j = JSON.parse(body); } catch { res.writeHead(400); res.end('bad json'); return; }
-      const requestId = j.request_id ?? j.requestId;
-      const text = clip(j.text ?? j.transcript, 4000).trim();
-      if (!requestId || !text) { res.writeHead(400); res.end('missing request_id or text'); return; }
-      if (j.reply_url) PENDING.set(String(requestId), { url: String(j.reply_url), exp: Date.now() + TTL_MS });
-      try {
-        await mcp.notification({
-          method: 'notifications/claude/channel',
-          params: { content: text, meta: { request_id: String(requestId), source: 'leo', host: 'leo' } },
-        });
-      } catch (err) {
-        process.stderr.write(`[leo-channel] notify error: ${err.message}\n`);
-      }
-      res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ ok: true, request_id: String(requestId) }));
-    });
+    res.writeHead(200); res.end('yielding');
+    process.stderr.write(`[leo-channel] yielding port ${PORT} to a newer session\n`);
+    setTimeout(() => {
+      try { activeServer?.closeAllConnections?.(); activeServer?.close(); } catch {}
+      activeServer = null;
+    }, 50);
+    return;
+  }
+  if (req.method !== 'POST') { res.writeHead(405); res.end('method not allowed'); return; }
+  const presented = (req.headers['x-webhook-token'] || '').toString().trim();
+  if (!presented || presented !== token) { res.writeHead(403); res.end('forbidden'); return; }
+  let body = '';
+  req.on('data', (c) => { body += c; });
+  req.on('end', async () => {
+    let j;
+    try { j = JSON.parse(body); } catch { res.writeHead(400); res.end('bad json'); return; }
+    const requestId = j.request_id ?? j.requestId;
+    const text = clip(j.text ?? j.transcript, 4000).trim();
+    if (!requestId || !text) { res.writeHead(400); res.end('missing request_id or text'); return; }
+    if (j.reply_url) PENDING.set(String(requestId), { url: String(j.reply_url), exp: Date.now() + TTL_MS });
+    try {
+      await mcp.notification({
+        method: 'notifications/claude/channel',
+        params: { content: text, meta: { request_id: String(requestId), source: 'leo', host: 'leo' } },
+      });
+    } catch (err) {
+      process.stderr.write(`[leo-channel] notify error: ${err.message}\n`);
+    }
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ ok: true, request_id: String(requestId) }));
   });
-  server.on('error', (e) => process.stderr.write(`[leo-channel] http listen skipped: ${e.code || e.message} (another session holds ${PORT})\n`));
-  server.listen(PORT, '0.0.0.0', () => process.stderr.write(`[leo-channel] listening on http://0.0.0.0:${PORT}\n`));
 }
+
+function bindWithTakeover(attempt = 0) {
+  const server = http.createServer(handleRequest);
+  server.on('error', async (e) => {
+    if (e.code === 'EADDRINUSE' && attempt < 6) {
+      process.stderr.write(`[leo-channel] port ${PORT} busy — requesting takeover (attempt ${attempt + 1})\n`);
+      try {
+        await fetch(`http://127.0.0.1:${PORT}${TAKEOVER_PATH}`, { method: 'POST', headers: { 'X-Webhook-Token': token } });
+      } catch (err) {
+        process.stderr.write(`[leo-channel] takeover request failed: ${err.message}\n`);
+      }
+      setTimeout(() => bindWithTakeover(attempt + 1), 350);
+    } else {
+      process.stderr.write(`[leo-channel] http listen failed: ${e.code || e.message}\n`);
+    }
+  });
+  server.listen(PORT, '0.0.0.0', () => {
+    activeServer = server;
+    process.stderr.write(`[leo-channel] listening on http://0.0.0.0:${PORT}\n`);
+  });
+}
+
+bindWithTakeover();
