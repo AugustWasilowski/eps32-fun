@@ -55,10 +55,15 @@ void espwifi_Init(const char *ssid, const char *password)
     wifi_config_t wifi_config = {};
     strncpy((char *)wifi_config.sta.ssid, ssid, sizeof(wifi_config.sta.ssid) - 1);
     strncpy((char *)wifi_config.sta.password, password, sizeof(wifi_config.sta.password) - 1);
+    // Battery saver: stay associated but let the radio sleep across several DTIM
+    // beacons. Cuts idle draw roughly in half vs the default; the only cost is that
+    // pushed replies/TTS arrive a few hundred ms later, which is fine for a desk buddy.
+    wifi_config.sta.listen_interval = 3;
 
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
     ESP_ERROR_CHECK(esp_wifi_start());
+    ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_MAX_MODEM));   // honor listen_interval above
     ESP_LOGI(TAG, "connecting to SSID '%s'...", ssid);
 }
 

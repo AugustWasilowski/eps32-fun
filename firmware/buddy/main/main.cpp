@@ -108,6 +108,15 @@ static int  s_queue_count = 0;
 static char s_ctx_base[24] = "Context: --";  // "Context: NN%" from the last poll
 static int  s_ctx_val = 0;                    // context % for the bar
 
+// Inactivity auto power-off. On a 450 mAh cell WiFi standby is the main drain, so
+// after IDLE_OFF_MIN of no interaction we release the GP17 latch (clean shutdown,
+// same path as a PWR long-press). "Interaction" = any button press, recording, or
+// an incoming reply/TTS — each call to mark_activity() resets the clock. On USB the
+// power-off is a no-op (VBUS holds VSYS), so we re-arm the timer to avoid re-chirping.
+#define IDLE_OFF_MIN 60
+static volatile int64_t s_last_activity_us = 0;
+static inline void mark_activity(void) { s_last_activity_us = esp_timer_get_time(); }
+
 // Flush LVGL's render buffer to the e-paper (full-screen partial refresh).
 // Identical pixel path to Waveshare's audio-test demo.
 static void epaper_flush_cb(lv_disp_drv_t *drv, const lv_area_t *area, lv_color_t *color_map)
@@ -613,7 +622,7 @@ static void http_get_display(void)
     char you_buf[288];
     snprintf(you_buf, sizeof(you_buf), "You: %s", txt[0] ? txt : "(say something)");
 
-    // Battery read pulses the GPIO17 gate, so throttle to every ~5 min (cache between).
+    // Battery read is cheap (ADC only) but noisy; throttle to every ~5 min (cache between).
     static int64_t s_batt_us = 0;
     static int s_batt_cache = -2;
     int64_t now_us = esp_timer_get_time();
@@ -648,6 +657,7 @@ static void http_get_display(void)
             s_reply[sizeof(s_reply) - 1] = '\0';
             render_reply_locked();
             strncpy(s_last_server_max, mx, sizeof(s_last_server_max) - 1);
+            if (mx[0]) mark_activity();   // a fresh reply counts as interaction
         }
         lvgl_unlock();
     }
@@ -751,6 +761,7 @@ static esp_err_t play_handler(httpd_req_t *req)
         httpd_resp_send_err(req, HTTPD_403_FORBIDDEN, "forbidden");
         return ESP_FAIL;
     }
+    mark_activity();   // pushed TTS/reply = interaction; keep the buddy awake
     int len = req->content_len;
     if (len <= 0 || len > MAX_TTS_BYTES) {
         httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "empty or too large");
@@ -1106,6 +1117,26 @@ static void cycle_mode(void)
     render_reply();   // clear the reply line in Notes mode; restore otherwise
 }
 
+// Inactivity watchdog: after IDLE_OFF_MIN with no interaction, power the board off
+// (drops the GP17 latch — clean shutdown, same as a PWR long-press). On battery this
+// actually cuts power; on USB it's a no-op (VBUS holds VSYS) so we re-arm and wait
+// another full interval instead of chirping every check.
+static void idle_off_task(void *arg)
+{
+    const int64_t idle_us = (int64_t)IDLE_OFF_MIN * 60 * 1000000LL;
+    for (;;) {
+        vTaskDelay(pdMS_TO_TICKS(30 * 1000));   // check every 30 s
+        if (esp_timer_get_time() - s_last_activity_us < idle_us) continue;
+        ESP_LOGI(TAG, "idle %d min -> power off", IDLE_OFF_MIN);
+        xSemaphoreTake(s_audio_mux, portMAX_DELAY);
+        play_tone(784, 120, 11000);             // same descending "power off" chirp
+        play_tone(523, 180, 11000);
+        xSemaphoreGive(s_audio_mux);
+        user_power_off();                       // GP17 low -> off on battery
+        mark_activity();                        // on USB (no-op off): re-arm the timer
+    }
+}
+
 // PWR button: a long-press powers the board off by releasing the GP17 latch
 // (user_power_off -> VBAT_POWER_OFF). This only actually cuts power on battery; on USB
 // the board stays up (VBUS holds VSYS), so the task simply loops and waits again.
@@ -1113,6 +1144,7 @@ static void pwr_power_task(void *arg)
 {
     for (;;) {
         EventBits_t e = xEventGroupWaitBits(pwr_groups, set_bit_all, pdTRUE, pdFALSE, portMAX_DELAY);
+        mark_activity();              // any PWR event is interaction
         if (get_bit_button(e, 2)) {   // long press
             ESP_LOGI(TAG, "PWR long-press -> power off");
             xSemaphoreTake(s_audio_mux, portMAX_DELAY);
@@ -1197,6 +1229,10 @@ extern "C" void app_main(void)
     // The PWR button now does power only: long-press = power off (drops the GP17 latch).
     xTaskCreatePinnedToCore(pwr_power_task, "pwr_pwr", 3 * 1024, NULL, 4, NULL, 1);
 
+    // Inactivity auto power-off (battery saver). Arm the clock now, then watch.
+    mark_activity();
+    xTaskCreatePinnedToCore(idle_off_task, "idle_off", 3 * 1024, NULL, 2, NULL, 1);
+
     ESP_LOGI(TAG, "Ready. Tap BOOT (GPIO%d) to switch mode; hold to record (up to %ds), release to send.",
              BOOT_BUTTON_PIN, MAX_RECORD_SEC);
 
@@ -1208,6 +1244,7 @@ extern "C" void app_main(void)
             continue;
         }
         // BOOT is down: distinguish a quick tap (switch mode) from a hold (record).
+        mark_activity();              // any BOOT press (tap or hold) is interaction
         int64_t t0 = esp_timer_get_time();
         while (ptt_pressed() && (esp_timer_get_time() - t0) < HOLD_US) {
             vTaskDelay(pdMS_TO_TICKS(10));
