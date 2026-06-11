@@ -82,6 +82,15 @@ async def synth_pcm16(text: str) -> bytes:
     if ch == 2:
         frames = audioop.tomono(frames, 2, 0.5, 0.5)
     pcm16k, _ = audioop.ratecv(frames, 2, 1, rate, 16000, None)
+    # Peak-normalize: Piper's output isn't full-scale, so the buddy's small speaker
+    # sounds quiet even at codec volume 100. Scale up so the loudest sample reaches
+    # ~97% of full scale (3% headroom = no clipping). Cap the boost at 8x so near-
+    # silence (e.g. a one-word reply with a long tail) isn't amplified into noise.
+    peak = audioop.max(pcm16k, 2)
+    if peak > 0:
+        factor = min(int(0.97 * 32767) / peak, 8.0)
+        if factor > 1.0:
+            pcm16k = audioop.mul(pcm16k, 2, factor)
     return pcm16k
 
 
